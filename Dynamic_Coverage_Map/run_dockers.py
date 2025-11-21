@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
+
+# run_dockers.py
 """
 自动化Docker批量执行脚本
 用于在多个Docker镜像中批量执行trace.py脚本
 """
 
-import docker
+import argparse
+import logging
 import os
 import sys
-import logging
-from datetime import datetime
-from pathlib import Path
-import json
 import time
-from typing import List, Dict, Optional
-import argparse
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import docker
+
+
+class InstanceLogFilter(logging.Filter):
+    """Filter records to only include logs for a specific instance."""
+
+    def __init__(self, instance_id: str):
+        super().__init__()
+        self.instance_id = instance_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record_instance = getattr(record, 'instance_id', None)
+        return record_instance == self.instance_id
 
 
 class DockerBatchRunner:
@@ -38,7 +51,8 @@ class DockerBatchRunner:
         self.script_dir = os.path.abspath(script_dir)
         self.result_base_dir = os.path.abspath(result_base_dir)
         self.image_prefix = image_prefix
-        self.log_dir = log_dir
+        self.log_dir = os.path.abspath(log_dir)
+        self.last_run_skipped = False
         
         # 创建日志目录
         os.makedirs(self.log_dir, exist_ok=True)
@@ -51,7 +65,7 @@ class DockerBatchRunner:
             self.client = docker.from_env()
             self.logger.info("成功连接到Docker")
         except Exception as e:
-            self.logger.error(f"无法连接到Docker: {e}")
+            self.logger.error(f"无法连接到Docker: {e}", exc_info=True)
             sys.exit(1)
         
         # 验证脚本文件存在
@@ -59,24 +73,32 @@ class DockerBatchRunner:
         
         # 创建结果基础目录
         os.makedirs(self.result_base_dir, exist_ok=True)
+        self.logger.info(f"结果基础目录: {self.result_base_dir}")
         
     def _setup_logging(self):
         """设置日志系统"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(self.log_dir, f"batch_run_{timestamp}.log")
+        self.batch_timestamp = timestamp
+        self.batch_log_dir = os.path.join(self.log_dir, f"batch_run_{timestamp}")
+        os.makedirs(self.batch_log_dir, exist_ok=True)
+        summary_log_file = os.path.join(self.batch_log_dir, "batch_run.log")
         
         # 创建logger
         self.logger = logging.getLogger("DockerBatchRunner")
         self.logger.setLevel(logging.DEBUG)
+        # 清理已有的处理器，避免重复
+        for handler in list(self.logger.handlers):
+            self.logger.removeHandler(handler)
+            handler.close()
         
         # 文件处理器 - 详细日志
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter(
+        self.file_formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        file_handler.setFormatter(file_formatter)
+        summary_handler = logging.FileHandler(summary_log_file, encoding='utf-8')
+        summary_handler.setLevel(logging.DEBUG)
+        summary_handler.setFormatter(self.file_formatter)
         
         # 控制台处理器 - 简洁输出
         console_handler = logging.StreamHandler(sys.stdout)
@@ -88,10 +110,44 @@ class DockerBatchRunner:
         console_handler.setFormatter(console_formatter)
         
         # 添加处理器
-        self.logger.addHandler(file_handler)
+        self.logger.addHandler(summary_handler)
         self.logger.addHandler(console_handler)
         
-        self.logger.info(f"日志文件: {log_file}")
+        self.logger.info(f"批次日志目录: {self.batch_log_dir}")
+        self.logger.info(f"批次汇总日志: {summary_log_file}")
+        self.logger.info("每个实例的日志将保存在该目录下，以实例名称命名")
+
+    def _sanitize_instance_id(self, instance_id: str) -> str:
+        """将实例标识符转换为安全的文件名"""
+        sanitized = instance_id.replace('/', '__').replace(':', '__').replace(' ', '_')
+        return sanitized
+
+    def _attach_instance_log_handler(self, instance_id: str) -> Tuple[logging.FileHandler, str]:
+        """
+        为指定实例添加独立的日志处理器
+        
+        Args:
+            instance_id: 镜像实例标识符
+            
+        Returns:
+            新增的日志处理器
+        """
+        sanitized = self._sanitize_instance_id(instance_id)
+        instance_log_file = os.path.join(self.batch_log_dir, f"{sanitized}.log")
+        try:
+            handler = logging.FileHandler(instance_log_file, encoding='utf-8')
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(self.file_formatter)
+            handler.addFilter(InstanceLogFilter(instance_id))
+            self.logger.addHandler(handler)
+            return handler, instance_log_file
+        except Exception as e:
+            self.logger.error(f"创建实例日志处理器失败: {instance_log_file} -> {e}", exc_info=True)
+            raise
+    
+    def _get_instance_logger(self, instance_id: str) -> logging.LoggerAdapter:
+        """创建带有instance_id上下文的LoggerAdapter"""
+        return logging.LoggerAdapter(self.logger, {'instance_id': instance_id})
         
     def _validate_scripts(self):
         """验证脚本文件是否存在"""
@@ -122,12 +178,12 @@ class DockerBatchRunner:
         images = []
         try:
             all_images = self.client.images.list()
+            self.logger.debug(f"共获取 {len(all_images)} 个Docker镜像供筛选")
             for image in all_images:
                 for tag in image.tags:
                     if tag.startswith(self.image_prefix):
                         # 从tag中提取实例名称
-                        # 例如: swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10949
-                        instance_name = tag.split(':')[0].split('_')[-1]  # 提取最后的数字部分
+                        instance_name = self._extract_instance_identifier(tag)
                         images.append({
                             'tag': tag,
                             'id': image.id,
@@ -138,14 +194,17 @@ class DockerBatchRunner:
             self.logger.info(f"找到 {len(images)} 个符合条件的镜像")
             for img in images:
                 self.logger.debug(f"  - {img['tag']} ({img['short_id']})")
+            
+            if not images:
+                self.logger.warning("未找到任何符合条件的镜像，请检查 image-prefix")
                 
             return images
             
         except Exception as e:
-            self.logger.error(f"获取镜像列表失败: {e}")
+            self.logger.error(f"获取镜像列表失败: {e}", exc_info=True)
             return []
     
-    def _is_already_processed(self, result_dir: str) -> bool:
+    def _is_already_processed(self, result_dir: str, logger: Optional[logging.Logger] = None) -> bool:
         """
         检查结果目录是否已存在且非空
         
@@ -155,17 +214,20 @@ class DockerBatchRunner:
         Returns:
             如果已处理返回True，否则False
         """
+        log = logger or self.logger
         if not os.path.exists(result_dir):
+            log.debug(f"结果目录不存在: {result_dir}")
             return False
         
         # 检查目录是否为空
         try:
             files = os.listdir(result_dir)
             if len(files) > 0:
-                self.logger.info(f"结果目录已存在且非空: {result_dir} (包含 {len(files)} 个文件)")
+                log.info(f"结果目录已存在且非空: {result_dir} (包含 {len(files)} 个文件)")
                 return True
+            log.debug(f"结果目录存在但为空: {result_dir}")
         except Exception as e:
-            self.logger.warning(f"检查结果目录失败: {e}")
+            log.warning(f"检查结果目录失败: {e}", exc_info=True)
         
         return False
     
@@ -175,8 +237,14 @@ class DockerBatchRunner:
         例如: swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10949:latest
         提取: scikit-learn-10949
         """
-        tag_without_latest = image_tag.split(':')[0]
-        parts = tag_without_latest.split('_')
+        tag_without_digest = image_tag.split('@')[0]
+        if ':' in tag_without_digest:
+            repo_candidate, possible_tag = tag_without_digest.rsplit(':', 1)
+            if possible_tag and possible_tag.lower() != 'latest':
+                return possible_tag
+            tag_without_digest = repo_candidate
+        
+        parts = tag_without_digest.split('_')
         if len(parts) >= 2:
             return '_'.join(parts[-2:])  # 取最后两部分
         return parts[-1]
@@ -193,23 +261,38 @@ class DockerBatchRunner:
         """
         image_tag = image_info['tag']
         instance_id = self._extract_instance_identifier(image_tag)
+        self.last_run_skipped = False
         
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info(f"开始处理镜像: {image_tag}")
-        self.logger.info(f"实例ID: {instance_id}")
-        self.logger.info(f"{'='*60}")
+        instance_handler = None
+        instance_log_file = ""
+        instance_logger: Optional[logging.LoggerAdapter] = None
+        try:
+            instance_handler, instance_log_file = self._attach_instance_log_handler(instance_id)
+            instance_logger = self._get_instance_logger(instance_id)
+            instance_logger.info(f"实例日志文件: {instance_log_file}")
+        except Exception:
+            self.logger.error(f"无法为实例 {instance_id} 创建日志处理器，终止该实例处理")
+            return False
+        
+        log = instance_logger
+        
+        log.info(f"\n{'='*60}")
+        log.info(f"开始处理镜像: {image_tag}")
+        log.info(f"实例ID: {instance_id}")
+        log.info(f"{'='*60}")
         
         # 准备结果目录
         result_dir = os.path.join(self.result_base_dir, instance_id, "result")
         
         # 检查是否已处理
-        if self._is_already_processed(result_dir):
-            self.logger.info(f"⏭️  跳过已处理的镜像: {instance_id}")
+        if self._is_already_processed(result_dir, logger=log):
+            log.info(f"⏭️  跳过已处理的镜像: {instance_id}")
+            self.last_run_skipped = True
             return True
         
         # 创建结果目录
         os.makedirs(result_dir, exist_ok=True)
-        self.logger.info(f"结果目录: {result_dir}")
+        log.info(f"结果目录: {result_dir}")
         
         container = None
         container_name = f"batch-run-{instance_id}-{int(time.time())}"
@@ -221,8 +304,8 @@ class DockerBatchRunner:
                 self.script_dir: {'bind': '/host_scripts', 'mode': 'ro'}
             }
             
-            self.logger.info(f"创建容器: {container_name}")
-            self.logger.debug(f"挂载卷: {volumes}")
+            log.info(f"创建容器: {container_name}")
+            log.debug(f"挂载卷: {volumes}")
             
             # 创建并启动容器
             container = self.client.containers.run(
@@ -237,7 +320,7 @@ class DockerBatchRunner:
                 remove=False  # 不自动删除，便于调试
             )
             
-            self.logger.info(f"✓ 容器已创建: {container.short_id}")
+            log.info(f"✓ 容器已创建: {container.short_id}")
             
             # 等待容器启动
             time.sleep(2)
@@ -252,7 +335,7 @@ class DockerBatchRunner:
             ]
             
             for i, cmd in enumerate(commands, 1):
-                self.logger.info(f"执行命令 {i}/{len(commands)}: {cmd[:80]}...")
+                log.info(f"执行命令 {i}/{len(commands)}: {cmd[:80]}...")
                 
                 try:
                     exit_code, output = container.exec_run(
@@ -268,45 +351,54 @@ class DockerBatchRunner:
                     
                     # 记录输出
                     if stdout_output:
-                        self.logger.debug(f"STDOUT:\n{stdout_output}")
+                        log.debug(f"STDOUT:\n{stdout_output}")
                     if stderr_output:
-                        self.logger.debug(f"STDERR:\n{stderr_output}")
+                        log.debug(f"STDERR:\n{stderr_output}")
                     
                     if exit_code != 0:
-                        self.logger.error(f"命令执行失败 (退出码: {exit_code})")
-                        self.logger.error(f"命令: {cmd}")
+                        log.error(f"命令执行失败 (退出码: {exit_code})")
+                        log.error(f"命令: {cmd}")
                         if stderr_output:
-                            self.logger.error(f"错误信息:\n{stderr_output}")
+                            log.error(f"错误信息:\n{stderr_output}")
                         return False
                     
-                    self.logger.info(f"✓ 命令 {i} 执行成功")
+                    log.info(f"✓ 命令 {i} 执行成功")
                     
                 except Exception as e:
-                    self.logger.error(f"执行命令时发生异常: {e}")
+                    log.error(f"执行命令时发生异常: {e}", exc_info=True)
                     return False
             
-            self.logger.info(f"✅ 镜像 {instance_id} 处理完成")
+            log.info(f"✅ 镜像 {instance_id} 处理完成")
             return True
             
         except docker.errors.ImageNotFound:
-            self.logger.error(f"镜像不存在: {image_tag}")
+            log.error(f"镜像不存在: {image_tag}", exc_info=True)
             return False
         except docker.errors.APIError as e:
-            self.logger.error(f"Docker API错误: {e}")
+            log.error(f"Docker API错误: {e}", exc_info=True)
             return False
         except Exception as e:
-            self.logger.error(f"处理镜像时发生未知错误: {e}", exc_info=True)
+            log.error(f"处理镜像时发生未知错误: {e}", exc_info=True)
             return False
         finally:
+            active_logger = log or self.logger
             # 清理容器
             if container:
                 try:
-                    self.logger.info(f"停止并删除容器: {container_name}")
+                    active_logger.info(f"停止并删除容器: {container_name}")
                     container.stop(timeout=10)
                     container.remove()
-                    self.logger.debug(f"容器已清理: {container_name}")
+                    active_logger.debug(f"容器已清理: {container_name}")
                 except Exception as e:
-                    self.logger.warning(f"清理容器时发生错误: {e}")
+                    active_logger.warning(f"清理容器时发生错误: {e}", exc_info=True)
+            if instance_handler:
+                try:
+                    active_logger.debug("移除实例日志处理器")
+                    self.logger.removeHandler(instance_handler)
+                    instance_handler.close()
+                except Exception as e:
+                    # 使用warning记录，避免影响其余实例
+                    active_logger.warning(f"关闭实例日志处理器失败: {e}", exc_info=True)
     
     def run_batch(self, max_containers: Optional[int] = None):
         """
@@ -322,9 +414,11 @@ class DockerBatchRunner:
             return
         
         total = len(images)
+        original_total = total
         if max_containers:
             total = min(total, max_containers)
             images = images[:max_containers]
+            self.logger.info(f"--max 参数设置为 {max_containers}，本次将处理 {total}/{original_total} 个镜像")
         
         self.logger.info(f"\n{'='*60}")
         self.logger.info(f"开始批量处理，共 {total} 个镜像")
@@ -337,20 +431,22 @@ class DockerBatchRunner:
         start_time = time.time()
         
         for idx, image_info in enumerate(images, 1):
-            self.logger.info(f"\n进度: [{idx}/{total}]")
+            instance_id = self._extract_instance_identifier(image_info['tag'])
+            instance_log_file = os.path.join(self.batch_log_dir, f"{self._sanitize_instance_id(instance_id)}.log")
+            self.logger.info(f"\n进度: [{idx}/{total}] - 实例: {instance_id}")
             
             result = self.run_in_container(image_info)
             
             if result:
-                # 检查是否是跳过的
-                instance_id = self._extract_instance_identifier(image_info['tag'])
-                result_dir = os.path.join(self.result_base_dir, instance_id, "result")
-                if self._is_already_processed(result_dir) and idx == 1:
+                if self.last_run_skipped:
                     skipped_count += 1
+                    self.logger.info(f"实例 {instance_id} 已跳过，日志: {instance_log_file}")
                 else:
                     success_count += 1
+                    self.logger.info(f"实例 {instance_id} 处理完成，日志: {instance_log_file}")
             else:
                 failed_count += 1
+                self.logger.error(f"实例 {instance_id} 处理失败，详见日志: {instance_log_file}")
         
         # 统计总结
         elapsed_time = time.time() - start_time
