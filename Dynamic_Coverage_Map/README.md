@@ -70,11 +70,9 @@
 示例命令：
 ```bash
 python run_dockers.py \
-  --script-dir ./utils \
-  --result-dir ./results \
-  --image-prefix ghcr.io/epoch-research/swe-bench.eval.x86_64 \
-  --log-dir ./logs \
-  --max 10        # 测试阶段仅运行前 10 个镜像
+  --script-dir /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/utils \
+  --result-dir /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results \
+  --image-prefix "ghcr.io/epoch-research/swe-bench.eval.x86_64"
 ```
 
 ### `trace.py` / `hooks.py` 如何工作
