@@ -1,4 +1,4 @@
 **/*.jsonl
 **/*.json
 **/*__pycache__
-**/*.log
+**/*.logDynamic_Coverage_Map/logs/
