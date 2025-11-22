@@ -327,13 +327,25 @@ class DockerBatchRunner:
             
             # 执行命令序列
             # 使用 conda run 在 testbed 环境中执行命令，确保使用正确的 Python 版本
+            # commands = [
+            #     # 在 testbed 环境中安装依赖
+            #     "conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && pip install pytest-json-report pytest-cov'",
+            #     # 在 testbed 环境中运行脚本
+            #     "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
+            # ]
+            
+            # 为了修补pytest仓库上的运行问题，而进行的兼容修改
             commands = [
-                # 在 testbed 环境中安装依赖
-                "conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && pip install pytest-json-report pytest-cov'",
-                # 在 testbed 环境中运行脚本
+                # 步骤1：检测是否存在pytest源码
+                r"test -f /testbed/src/_pytest/__init__.py && echo 'has_pytest_src' > /tmp/pytest_check.txt || echo 'no_pytest_src' > /tmp/pytest_check.txt",
+                
+                # 步骤2：根据检测结果安装依赖
+                r"""conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; CHECK=$(cat /tmp/pytest_check.txt); if [ "$CHECK" = "has_pytest_src" ]; then echo 检测到testbed中有pytest源码,安装兼容旧版本的插件; pip install pytest-json-report==1.5.0 pytest-metadata==2.0.4 pytest-cov==2.12.1; else echo 未检测到pytest源码,使用默认安装; pip install pytest-json-report pytest-cov; fi'""",
+                
+                # 步骤3：运行脚本
                 "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
             ]
-            
+
             for i, cmd in enumerate(commands, 1):
                 log.info(f"执行命令 {i}/{len(commands)}: {cmd[:80]}...")
                 
