@@ -88,19 +88,44 @@ def run_pytest(cwd: str, pytest_args: List[str]) -> None:
     env["SETUPTOOLS_USE_DISTUTILS"] = "local"
 
     # run pytest
-    # result = run_subprocess_compatible(cmd)
     result = run_subprocess_compatible(cmd, shell=True, cwd=cwd, env=env)
-    # result = subprocess.run(cmd, shell=True, cwd=cwd, env=env, capture_output=True)
 
     # clear python cache
     clear_python_cache(cwd)
 
     if result.returncode != 0:
-        printf(f"pytest failed with return code {result.returncode}")
-        printf(f"pytest output:\n{result.stdout.decode()}")
-        printf(f"pytest error:\n{result.stderr.decode()}")
-        raise Exception(f"pytest failed with return code {result.returncode}")
-
+        stdout_text = result.stdout.decode()
+        stderr_text = result.stderr.decode()
+        
+        # 返回码2: 部分测试收集失败，但可以继续
+        if result.returncode == 2:
+            printf(f"⚠️  pytest collection completed with some errors (return code {result.returncode})")
+            
+            # 解析并记录收集失败的文件/测试
+            error_lines = [line for line in stdout_text.split('\n') if line.startswith('ERROR ')]
+            if error_lines:
+                printf(f"📋 Collection errors found in {len(error_lines)} file(s):")
+                for error_line in error_lines:
+                    # 提取文件路径（ERROR 后面的部分）
+                    file_path = error_line.replace('ERROR ', '').strip()
+                    printf(f"  ❌ {file_path}")
+            
+            # 提取成功收集的测试数量
+            import re
+            match = re.search(r'(\d+) tests? collected', stdout_text)
+            if match:
+                collected_count = match.group(1)
+                printf(f"✅ Successfully collected {collected_count} tests despite collection errors")
+            
+            printf(f"ℹ️  Continuing with successfully collected tests...")
+            printf("─" * 60)
+            
+        # 返回码1或其他: 真正的失败
+        else:
+            printf(f"❌ pytest failed with return code {result.returncode}")
+            printf(f"pytest output:\n{stdout_text}")
+            printf(f"pytest error:\n{stderr_text}")
+            raise Exception(f"pytest failed with return code {result.returncode}")
 
 def collect_tests(
     project_root: str,

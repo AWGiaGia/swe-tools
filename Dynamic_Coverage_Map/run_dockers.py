@@ -37,7 +37,8 @@ class DockerBatchRunner:
         script_dir: str,
         result_base_dir: str,
         image_prefix: str = "swebench/sweb.eval.x86_64.scikit-learn_1776",
-        log_dir: str = "./logs"
+        log_dir: str = "./logs",
+        parallel: int = 1  # 新增参数
     ):
         """
         初始化批量执行器
@@ -53,7 +54,10 @@ class DockerBatchRunner:
         self.image_prefix = image_prefix
         self.log_dir = os.path.abspath(log_dir)
         self.last_run_skipped = False
-        
+        self.log_dir = os.path.abspath(log_dir)
+        self.last_run_skipped = False
+        self.parallel = parallel  # 新增：保存并行度
+
         # 创建日志目录
         os.makedirs(self.log_dir, exist_ok=True)
         
@@ -419,6 +423,9 @@ class DockerBatchRunner:
         Args:
             max_containers: 最大处理容器数量，None表示处理所有
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
         images = self.get_target_images()
         
         if not images:
@@ -432,33 +439,79 @@ class DockerBatchRunner:
             images = images[:max_containers]
             self.logger.info(f"--max 参数设置为 {max_containers}，本次将处理 {total}/{original_total} 个镜像")
         
+        # 确定实际并行度
+        actual_parallel = min(self.parallel, total)
+        
         self.logger.info(f"\n{'='*60}")
         self.logger.info(f"开始批量处理，共 {total} 个镜像")
+        if actual_parallel > 1:
+            self.logger.info(f"并行度: {actual_parallel} 个容器同时处理")
+        else:
+            self.logger.info(f"串行模式（并行度: 1）")
         self.logger.info(f"{'='*60}\n")
         
+        # 线程安全的计数器
         success_count = 0
         failed_count = 0
         skipped_count = 0
+        count_lock = threading.Lock()
         
         start_time = time.time()
         
-        for idx, image_info in enumerate(images, 1):
+        def process_image_wrapper(idx_and_info):
+            """包装函数，用于并行执行"""
+            idx, image_info = idx_and_info
+            nonlocal success_count, failed_count, skipped_count
+            
             instance_id = self._extract_instance_identifier(image_info['tag'])
-            instance_log_file = os.path.join(self.batch_log_dir, f"{self._sanitize_instance_id(instance_id)}.log")
+            instance_log_file = os.path.join(
+                self.batch_log_dir, 
+                f"{self._sanitize_instance_id(instance_id)}.log"
+            )
+            
             self.logger.info(f"\n进度: [{idx}/{total}] - 实例: {instance_id}")
             
             result = self.run_in_container(image_info)
             
-            if result:
-                if self.last_run_skipped:
-                    skipped_count += 1
-                    self.logger.info(f"实例 {instance_id} 已跳过，日志: {instance_log_file}")
+            # 线程安全地更新计数器
+            with count_lock:
+                if result:
+                    if self.last_run_skipped:
+                        skipped_count += 1
+                        self.logger.info(f"实例 {instance_id} 已跳过，日志: {instance_log_file}")
+                    else:
+                        success_count += 1
+                        self.logger.info(f"实例 {instance_id} 处理完成，日志: {instance_log_file}")
                 else:
-                    success_count += 1
-                    self.logger.info(f"实例 {instance_id} 处理完成，日志: {instance_log_file}")
-            else:
-                failed_count += 1
-                self.logger.error(f"实例 {instance_id} 处理失败，详见日志: {instance_log_file}")
+                    failed_count += 1
+                    self.logger.error(f"实例 {instance_id} 处理失败，详见日志: {instance_log_file}")
+            
+            return result
+        
+        # 串行或并行处理
+        if actual_parallel == 1:
+            # 串行模式（保持原有行为）
+            for idx, image_info in enumerate(images, 1):
+                process_image_wrapper((idx, image_info))
+        else:
+            # 并行模式
+            with ThreadPoolExecutor(max_workers=actual_parallel) as executor:
+                # 提交所有任务
+                futures = {
+                    executor.submit(process_image_wrapper, (idx, image_info)): (idx, image_info)
+                    for idx, image_info in enumerate(images, 1)
+                }
+                
+                # 等待完成（保持提交顺序的进度显示）
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        idx, image_info = futures[future]
+                        instance_id = self._extract_instance_identifier(image_info['tag'])
+                        self.logger.error(f"处理实例 {instance_id} 时发生未捕获异常: {e}", exc_info=True)
+                        with count_lock:
+                            failed_count += 1
         
         # 统计总结
         elapsed_time = time.time() - start_time
@@ -471,10 +524,11 @@ class DockerBatchRunner:
         self.logger.info(f"⏭️  跳过: {skipped_count}")
         self.logger.info(f"❌ 失败: {failed_count}")
         self.logger.info(f"⏱️  总耗时: {elapsed_time:.2f} 秒 ({elapsed_time/60:.2f} 分钟)")
+        if actual_parallel > 1:
+            self.logger.info(f"⚡ 平均每个容器: {elapsed_time/total:.2f} 秒")
         
         if failed_count > 0:
             self.logger.warning(f"\n有 {failed_count} 个镜像处理失败，请查看日志文件了解详情")
-
 
 def main():
     """主函数"""
@@ -524,7 +578,14 @@ def main():
         default=None,
         help='最大处理镜像数量（用于测试，默认处理所有镜像）'
     )
-    
+
+    parser.add_argument(
+        '--parallel',
+        type=int,
+        default=8,
+        help='并行处理的容器数量（默认: 1，建议: 4-8）'
+    )
+
     args = parser.parse_args()
     
     # 验证目录存在
@@ -537,7 +598,8 @@ def main():
         script_dir=args.script_dir,
         result_base_dir=args.result_dir,
         image_prefix=args.image_prefix,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        parallel=args.parallel  # 新增参数
     )
     
     runner.run_batch(max_containers=args.max)
