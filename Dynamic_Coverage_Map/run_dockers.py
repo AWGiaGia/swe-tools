@@ -365,11 +365,20 @@ class DockerBatchRunner:
                     stdout_output = output[0].decode('utf-8') if output[0] else ""
                     stderr_output = output[1].decode('utf-8') if output[1] else ""
                     
-                    # 记录输出
-                    if stdout_output:
-                        log.debug(f"STDOUT:\n{stdout_output}")
-                    if stderr_output:
-                        log.debug(f"STDERR:\n{stderr_output}")
+                    # 对于最后一个命令（trace.py执行），记录更详细的信息
+                    if i == len(commands):
+                        log.info(f"========== trace.py执行输出（完整） ==========")
+                        if stdout_output:
+                            log.info(f"STDOUT:\n{stdout_output}")
+                        if stderr_output:
+                            log.info(f"STDERR:\n{stderr_output}")
+                        log.info(f"=" * 60)
+                    else:
+                        # 其他命令保持原有的DEBUG级别
+                        if stdout_output:
+                            log.debug(f"STDOUT:\n{stdout_output}")
+                        if stderr_output:
+                            log.debug(f"STDERR:\n{stderr_output}")
                     
                     if exit_code != 0:
                         log.error(f"命令执行失败 (退出码: {exit_code})")
