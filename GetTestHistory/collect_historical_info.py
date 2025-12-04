@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-收集测试函数的历史编辑信息
+收集测试函数的历史编辑信息（优化版本）
 功能包括:
 1. 测试与被测代码的共同修改记录
 2. commit元信息(message, type)
 3. 修改的时间线与频率
 4. 修改的原子性分组
+
+优化内容:
+- 方案一: 批量处理Git操作，使用git log -p一次性获取diff
+- 方案二: 使用git show避免checkout切换
+- 方案三: 并行处理多个instance
+- 方案五: 缓存AST解析结果
+- 方案六: 预筛选减少不必要分析
 """
 
 import os
@@ -21,6 +28,9 @@ from typing import Dict, List, Set, Tuple, Optional
 from datetime import datetime
 from collections import defaultdict
 import subprocess
+from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 from datasets import load_dataset
 
@@ -28,50 +38,28 @@ from datasets import load_dataset
 class PythonEntityExtractor:
     """从Python代码修改中提取实体信息"""
     
+    # 方案五: 类级别的缓存，用于存储解析结果
+    _parse_cache: Dict[Tuple[str, str], Dict[int, str]] = {}
+    
     @staticmethod
-    def parse_file(file_path: str) -> Dict[str, Set[str]]:
+    def parse_source(source: str) -> Dict[int, str]:
         """
-        解析Python文件，提取所有实体(函数、方法、类)
+        解析Python源代码字符串，提取所有实体(函数、方法、类)
         返回: {line_number: entity_name}的映射
         """
         entities = {}
         
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                source = f.read()
-            
-            # # 尝试使用Python 3语法解析
-            # try:
-            #     tree = ast.parse(source)
-            # except SyntaxError:
-            #     # 如果失败，尝试使用Python 2兼容模式
-            #     # 将print语句转换为print函数
-            #     import re
-            #     # 简单的print语句转换（处理常见情况）
-            #     source_py3 = re.sub(r'\bprint\s+([^(])', r'print(\1)', source)
-            #     try:
-            #         tree = ast.parse(source_py3)
-            #     except SyntaxError:
-            #         # 仍然失败，跳过该文件
-            #         logging.debug(f"Skipping file with incompatible syntax: {file_path}")
-            #         return entities
-            
             # 尝试使用Python 3语法解析
             try:
                 tree = ast.parse(source)
-            except SyntaxError as e:
+            except SyntaxError:
                 # 如果失败，尝试使用Python 2兼容模式
-                logging.debug(f"Python 3 parse failed for {file_path}, trying Python 2 compatibility mode")
                 # 将print语句转换为print函数
-                import re
-                # 简单的print语句转换（处理常见情况）
                 source_py3 = re.sub(r'\bprint\s+([^(])', r'print(\1)', source)
                 try:
                     tree = ast.parse(source_py3)
-                    logging.debug(f"Successfully parsed {file_path} with Python 2 compatibility mode")
                 except SyntaxError:
-                    # 仍然失败，跳过该文件
-                    logging.debug(f"Skipping file with incompatible syntax: {file_path}")
                     return entities
 
             for node in ast.walk(tree):
@@ -90,10 +78,24 @@ class PythonEntityExtractor:
                     # 顶层函数
                     entities[node.lineno] = node.name
                     
-        except Exception as e:
-            logging.warning(f"Failed to parse {file_path}: {e}")
+        except Exception:
+            pass
             
         return entities
+    
+    @staticmethod
+    def parse_file(file_path: str) -> Dict[int, str]:
+        """
+        解析Python文件，提取所有实体(函数、方法、类)
+        返回: {line_number: entity_name}的映射
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            return PythonEntityExtractor.parse_source(source)
+        except Exception as e:
+            logging.warning(f"Failed to parse {file_path}: {e}")
+            return {}
     
     @staticmethod
     def find_entity_at_line(entities: Dict[int, str], line_num: int) -> Optional[str]:
@@ -135,13 +137,21 @@ class CommitAnalyzer:
 class GitRepoManager:
     """管理Git仓库操作"""
     
-    def __init__(self, temp_dir: str):
+    def __init__(self, temp_dir: str, instance_id: str = None):
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        # 用于区分不同instance的仓库路径
+        self.instance_id = instance_id
+        # 方案五: 缓存文件内容解析结果
+        self._file_content_cache: Dict[Tuple[str, str], str] = {}
+        self._entity_cache: Dict[Tuple[str, str], Dict[int, str]] = {}
     
     def clone_repo(self, repo_url: str, commit_hash: str) -> Optional[Path]:
         """克隆仓库到指定commit"""
         repo_name = repo_url.split('/')[-1].replace('.git', '')
+        # 并行处理时，为每个instance使用独立的目录
+        if self.instance_id:
+            repo_name = f"{repo_name}_{self.instance_id}"
         repo_path = self.temp_dir / repo_name
         
         if repo_path.exists():
@@ -174,11 +184,7 @@ class GitRepoManager:
                         since_commit: Optional[str] = None) -> List[Dict]:
         """获取文件的commit历史"""
         try:
-            # 基础命令:获取文件的完整历史(--follow追踪重命名)
             cmd = ['git', 'log', '--follow', '--format=%H|%at|%s', '--', file_path]
-            
-            # 注意:不使用since_commit参数,因为我们已经checkout到base_commit
-            # 直接获取从初始到当前HEAD(即base_commit)的所有历史
             
             result = subprocess.run(
                 cmd,
@@ -203,7 +209,7 @@ class GitRepoManager:
                     })
             
             if not commits:
-                logging.warning(f"No commit history found for {file_path} - file may not exist at base_commit")
+                logging.warning(f"No commit history found for {file_path}")
             
             return commits
             
@@ -214,46 +220,74 @@ class GitRepoManager:
             logging.warning(f"Failed to get commit history for {file_path}: {e}")
             return []
     
+    # 方案一: 批量获取commit的diff信息
+    def get_batch_commit_diffs(self, repo_path: Path, commit_hashes: List[str]) -> Dict[str, Dict[str, List[Tuple[int, int]]]]:
+        """
+        批量获取多个commit的diff信息
+        返回: {commit_hash: {file_path: [(start_line, end_line), ...]}}
+        """
+        if not commit_hashes:
+            return {}
+        
+        result = {}
+        
+        # 使用git show批量获取diff，每次处理一批以避免命令行过长
+        batch_size = 50
+        for i in range(0, len(commit_hashes), batch_size):
+            batch = commit_hashes[i:i + batch_size]
+            
+            for commit_hash in batch:
+                try:
+                    diff_result = subprocess.run(
+                        ['git', 'diff', f'{commit_hash}^', commit_hash, '--unified=0'],
+                        cwd=repo_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    
+                    if diff_result.returncode != 0:
+                        continue
+                    
+                    result[commit_hash] = self._parse_diff_output(diff_result.stdout)
+                    
+                except Exception as e:
+                    logging.debug(f"Failed to get diff for commit {commit_hash}: {e}")
+                    result[commit_hash] = {}
+        
+        return result
+    
+    def _parse_diff_output(self, diff_output: str) -> Dict[str, List[Tuple[int, int]]]:
+        """解析git diff输出"""
+        modified_files = {}
+        current_file = None
+        
+        for line in diff_output.split('\n'):
+            # 解析文件路径
+            if line.startswith('+++'):
+                file_match = re.match(r'\+\+\+ b/(.+)', line)
+                if file_match:
+                    current_file = file_match.group(1)
+                    if current_file not in modified_files:
+                        modified_files[current_file] = []
+            
+            # 解析修改的行号
+            elif line.startswith('@@') and current_file:
+                match = re.search(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', line)
+                if match:
+                    start = int(match.group(1))
+                    count = int(match.group(2)) if match.group(2) else 1
+                    modified_files[current_file].append((start, start + count - 1))
+        
+        return modified_files
+    
     def get_commit_diff(self, repo_path: Path, commit_hash: str) -> Dict[str, List[Tuple[int, int]]]:
         """
-        获取commit的diff信息
+        获取commit的diff信息（保留原接口，内部使用批量方法）
         返回: {file_path: [(start_line, end_line), ...]}
         """
-        try:
-            result = subprocess.run(
-                ['git', 'diff', f'{commit_hash}^', commit_hash, '--unified=0'],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            modified_files = {}
-            current_file = None
-            
-            for line in result.stdout.split('\n'):
-                # 解析文件路径
-                if line.startswith('+++'):
-                    file_match = re.match(r'\+\+\+ b/(.+)', line)
-                    if file_match:
-                        current_file = file_match.group(1)
-                        if current_file not in modified_files:
-                            modified_files[current_file] = []
-                
-                # 解析修改的行号
-                elif line.startswith('@@') and current_file:
-                    # 格式: @@ -old_start,old_count +new_start,new_count @@
-                    match = re.search(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', line)
-                    if match:
-                        start = int(match.group(1))
-                        count = int(match.group(2)) if match.group(2) else 1
-                        modified_files[current_file].append((start, start + count - 1))
-            
-            return modified_files
-            
-        except Exception as e:
-            logging.warning(f"Failed to get diff for commit {commit_hash}: {e}")
-            return {}
+        result = self.get_batch_commit_diffs(repo_path, [commit_hash])
+        return result.get(commit_hash, {})
     
     def get_files_in_commit(self, repo_path: Path, commit_hash: str) -> List[str]:
         """获取commit中修改的所有文件"""
@@ -271,19 +305,115 @@ class GitRepoManager:
         except Exception as e:
             logging.warning(f"Failed to get files in commit {commit_hash}: {e}")
             return []
+    
+    # 方案一: 批量获取commit中的文件列表
+    def get_batch_files_in_commits(self, repo_path: Path, commit_hashes: List[str]) -> Dict[str, List[str]]:
+        """
+        批量获取多个commit中修改的文件
+        返回: {commit_hash: [file_path, ...]}
+        """
+        result = {}
+        
+        for commit_hash in commit_hashes:
+            try:
+                cmd_result = subprocess.run(
+                    ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', commit_hash],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if cmd_result.returncode == 0:
+                    files = [f for f in cmd_result.stdout.strip().split('\n') if f]
+                    result[commit_hash] = files
+                else:
+                    result[commit_hash] = []
+                    
+            except Exception:
+                result[commit_hash] = []
+        
+        return result
+    
+    # 方案二: 使用git show获取文件内容，避免checkout
+    def get_file_content_at_commit(self, repo_path: Path, commit_hash: str, file_path: str) -> Optional[str]:
+        """
+        获取指定commit时的文件内容（不需要checkout）
+        """
+        cache_key = (commit_hash, file_path)
+        
+        # 方案五: 检查缓存
+        if cache_key in self._file_content_cache:
+            return self._file_content_cache[cache_key]
+        
+        try:
+            result = subprocess.run(
+                ['git', 'show', f'{commit_hash}:{file_path}'],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                content = result.stdout
+                # 缓存结果（限制缓存大小）
+                if len(self._file_content_cache) < 1000:
+                    self._file_content_cache[cache_key] = content
+                return content
+            return None
+            
+        except Exception as e:
+            logging.debug(f"Failed to get file content for {file_path} at {commit_hash}: {e}")
+            return None
+    
+    # 方案二: 获取commit父提交时的文件内容
+    def get_file_content_before_commit(self, repo_path: Path, commit_hash: str, file_path: str) -> Optional[str]:
+        """
+        获取commit之前（父提交）的文件内容
+        """
+        return self.get_file_content_at_commit(repo_path, f'{commit_hash}^', file_path)
+    
+    # 方案五: 获取并缓存实体映射
+    def get_entities_at_commit(self, repo_path: Path, commit_hash: str, file_path: str) -> Dict[int, str]:
+        """
+        获取指定commit时文件的实体映射（带缓存）
+        """
+        cache_key = (commit_hash, file_path)
+        
+        if cache_key in self._entity_cache:
+            return self._entity_cache[cache_key]
+        
+        content = self.get_file_content_at_commit(repo_path, commit_hash, file_path)
+        if content is None:
+            return {}
+        
+        entities = PythonEntityExtractor.parse_source(content)
+        
+        # 缓存结果
+        if len(self._entity_cache) < 2000:
+            self._entity_cache[cache_key] = entities
+        
+        return entities
+    
+    def clear_cache(self):
+        """清理缓存"""
+        self._file_content_cache.clear()
+        self._entity_cache.clear()
 
 
 class HistoricalInfoCollector:
     """收集测试函数的历史信息"""
     
-    def __init__(self, output_dir: str, log_dir: str):
+    def __init__(self, output_dir: str, log_dir: str, instance_id: str = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        self.git_manager = GitRepoManager(tempfile.gettempdir() + '/swe_bench_repos')
+        # 传入instance_id用于区分并行任务的仓库路径
+        self.git_manager = GitRepoManager(tempfile.gettempdir() + '/swe_bench_repos', instance_id)
         self.entity_extractor = PythonEntityExtractor()
     
     def setup_logger(self, instance_id: str) -> logging.Logger:
@@ -310,39 +440,25 @@ class HistoricalInfoCollector:
         
         return logger
     
-    def extract_entities_from_diff(self, repo_path: Path, commit_hash: str, 
-                                file_path: str, modified_lines: List[Tuple[int, int]]) -> Set[str]:
-        """从diff中提取被修改的实体"""
+    # 方案二: 重写实体提取方法，不使用checkout
+    def extract_entities_from_diff_optimized(self, repo_path: Path, commit_hash: str, 
+                                            file_path: str, modified_lines: List[Tuple[int, int]]) -> Set[str]:
+        """
+        从diff中提取被修改的实体（优化版本，不使用checkout）
+        """
         entities = set()
         
-        # 记录当前commit，确保最后能恢复
-        current_commit = None
+        if not file_path.endswith('.py'):
+            return entities
         
         try:
-            # 先记录当前所在的commit
-            result = subprocess.run(
-                ['git', 'rev-parse', 'HEAD'],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            current_commit = result.stdout.strip()
-            
-            # 检出到commit前的状态
-            subprocess.run(
-                ['git', 'checkout', f'{commit_hash}^', '--quiet'],
-                cwd=repo_path,
-                capture_output=True,
-                check=True
+            # 方案二: 使用git show获取commit前的文件内容
+            entity_map = self.git_manager.get_entities_at_commit(
+                repo_path, f'{commit_hash}^', file_path
             )
             
-            full_path = repo_path / file_path
-            if not full_path.exists() or not file_path.endswith('.py'):
+            if not entity_map:
                 return entities
-            
-            # 解析文件
-            entity_map = self.entity_extractor.parse_file(str(full_path))
             
             # 找到修改的实体
             for start, end in modified_lines:
@@ -352,23 +468,15 @@ class HistoricalInfoCollector:
                         entities.add(f"{file_path}::{entity}")
             
         except Exception as e:
-            logging.warning(f"Failed to extract entities from {file_path}: {e}")
-        
-        finally:
-            # 无论成功失败，都要恢复到原来的commit
-            if current_commit:
-                try:
-                    subprocess.run(
-                        ['git', 'checkout', current_commit, '--quiet'],
-                        cwd=repo_path,
-                        capture_output=True,
-                        check=True
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to restore commit {current_commit}: {e}")
+            logging.debug(f"Failed to extract entities from {file_path}: {e}")
         
         return entities
 
+    # 保留原方法作为备用，但标记为deprecated
+    def extract_entities_from_diff(self, repo_path: Path, commit_hash: str, 
+                                file_path: str, modified_lines: List[Tuple[int, int]]) -> Set[str]:
+        """从diff中提取被修改的实体（使用优化版本）"""
+        return self.extract_entities_from_diff_optimized(repo_path, commit_hash, file_path, modified_lines)
 
     def collect_for_test(self, logger: logging.Logger, repo_path: Path, 
                         test_function: str, covered_entities: List[str],
@@ -376,20 +484,6 @@ class HistoricalInfoCollector:
         """收集单个测试函数的历史信息"""
         logger.info(f"Collecting history for test: {test_function}")
         
-        # 确保当前在base_commit
-        try:
-            subprocess.run(
-                ['git', 'checkout', base_commit, '--quiet'],
-                cwd=repo_path,
-                capture_output=True,
-                check=True
-            )
-            logger.debug(f"Ensured HEAD is at base_commit: {base_commit}")
-        except Exception as e:
-            logger.error(f"Failed to checkout base_commit: {e}")
-            return result
-
-
         result = {
             'test_function': test_function,
             'covered_entities': covered_entities,
@@ -410,82 +504,63 @@ class HistoricalInfoCollector:
         # 解析测试函数路径
         test_file = test_function.split('::')[0]
 
-        # 先检查文件是否存在
-        test_file_full_path = repo_path / test_file
-        if not test_file_full_path.exists():
+        # 方案二: 使用git show检查文件是否存在，而不是检查工作目录
+        test_file_content = self.git_manager.get_file_content_at_commit(repo_path, base_commit, test_file)
+        if test_file_content is None:
             logger.warning(f"Test file does not exist at base_commit: {test_file}")
-            
-            # 诊断信息
-            try:
-                result_head = subprocess.run(
-                    ['git', 'rev-parse', 'HEAD'],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                current_commit = result_head.stdout.strip()
-                logger.warning(f"Current HEAD: {current_commit}, Expected: {base_commit}")
-                
-                # 检查文件是否被git追踪
-                result_ls = subprocess.run(
-                    ['git', 'ls-files', test_file],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True
-                )
-                if result_ls.stdout.strip():
-                    logger.warning(f"File IS tracked by git: {test_file}")
-                else:
-                    logger.warning(f"File is NOT tracked by git at current commit")
-                
-                # 查找文件第一次被添加的commit
-                result_log = subprocess.run(
-                    ['git', 'log', '--diff-filter=A', '--format=%H|%ai', '--', test_file],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True
-                )
-                if result_log.stdout.strip():
-                    first_commit_line = result_log.stdout.strip().split('\n')[0]
-                    logger.warning(f"File first added in commit: {first_commit_line}")
-                else:
-                    logger.warning(f"No commit found that added this file")
-                    
-            except Exception as e:
-                logger.error(f"Failed to diagnose: {e}")
-            
-            # 文件不存在，返回空结果
             return result
         
         logger.debug(f"Test file exists: {test_file}")
 
-        # 获取测试文件的commit历史（只调用一次）
+        # 获取测试文件的commit历史
         test_commits = self.git_manager.get_commit_history(repo_path, test_file)
         logger.info(f"Found {len(test_commits)} commits for test file")
         
         result['test_modification_history'] = test_commits
         result['statistics']['total_test_modifications'] = len(test_commits)
         
+        if not test_commits:
+            return result
+        
         # 创建covered entities的集合用于快速查找
         covered_set = set(covered_entities)
         
-        # 分析每个commit
-        first_test_commit_time = None
-        if test_commits:
-            first_test_commit_time = test_commits[-1]['timestamp']  # 最早的commit
+        # 方案六: 预先提取covered entities涉及的文件
+        covered_files = set()
+        for entity in covered_entities:
+            if '::' in entity:
+                covered_files.add(entity.split('::')[0])
         
+        # 方案一: 批量获取所有commit的信息
+        commit_hashes = [c['commit_hash'] for c in test_commits]
+        
+        logger.debug(f"Batch fetching diff info for {len(commit_hashes)} commits...")
+        all_diffs = self.git_manager.get_batch_commit_diffs(repo_path, commit_hashes)
+        
+        logger.debug(f"Batch fetching file lists for {len(commit_hashes)} commits...")
+        all_files = self.git_manager.get_batch_files_in_commits(repo_path, commit_hashes)
+        
+        first_test_commit_time = test_commits[-1]['timestamp'] if test_commits else None
         co_modified_entities = set()
         
         for commit_info in test_commits:
             commit_hash = commit_info['commit_hash']
             logger.debug(f"Analyzing commit: {commit_hash}")
             
-            # 获取该commit修改的所有文件
-            modified_files_in_commit = self.git_manager.get_files_in_commit(repo_path, commit_hash)
+            # 使用预先获取的数据
+            modified_files_in_commit = all_files.get(commit_hash, [])
+            file_diffs = all_diffs.get(commit_hash, {})
             
-            # 获取diff信息
-            file_diffs = self.git_manager.get_commit_diff(repo_path, commit_hash)
+            # 方案六: 快速检查是否有可能涉及covered entities
+            modified_py_files = [f for f in modified_files_in_commit if f.endswith('.py')]
+            
+            # 检查是否有covered files被修改
+            has_covered_file = any(f in covered_files for f in modified_py_files)
+            has_test_file = test_file in modified_files_in_commit
+            
+            if not has_test_file and not has_covered_file:
+                # 方案六: 跳过不相关的commit
+                continue
             
             # 提取该commit中修改的所有实体
             modified_entities_in_commit = set()
@@ -494,7 +569,11 @@ class HistoricalInfoCollector:
                 if not file_path.endswith('.py'):
                     continue
                 
-                entities = self.extract_entities_from_diff(
+                # 方案六: 只处理相关文件
+                if file_path != test_file and file_path not in covered_files:
+                    continue
+                
+                entities = self.extract_entities_from_diff_optimized(
                     repo_path, commit_hash, file_path, line_ranges
                 )
                 modified_entities_in_commit.update(entities)
@@ -502,7 +581,7 @@ class HistoricalInfoCollector:
             # 只保留在covered_entities中的实体
             covered_modified = modified_entities_in_commit & covered_set
             
-            if test_function in modified_entities_in_commit or test_file in modified_files_in_commit:
+            if test_function in modified_entities_in_commit or has_test_file:
                 # 这是一个包含测试函数的commit
                 if covered_modified:
                     # 测试与覆盖的实体共同修改
@@ -580,7 +659,7 @@ class HistoricalInfoCollector:
             repo_path = self.git_manager.clone_repo(repo, base_commit)
             if not repo_path:
                 logger.error("Failed to clone repository")
-                return
+                return None
             
             logger.info(f"Repository cloned to: {repo_path}")
             
@@ -596,6 +675,9 @@ class HistoricalInfoCollector:
                 
                 results[test_function] = test_result
             
+            # 清理缓存
+            self.git_manager.clear_cache()
+            
             # 保存结果
             output_file = self.output_dir / f'{instance_id}.json'
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -604,23 +686,58 @@ class HistoricalInfoCollector:
             logger.info(f"Results saved to: {output_file}")
             logger.info(f"Successfully processed {len(results)} test functions")
             
+            return instance_id
+            
         except Exception as e:
             logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
+            return None
         
         finally:
-            # 清理
+            # 清理克隆的仓库目录
             logger.info("Cleaning up...")
+            try:
+                if repo_path and repo_path.exists():
+                    shutil.rmtree(repo_path)
+                    logger.info(f"Removed cloned repo: {repo_path}")
+            except NameError:
+                # repo_path未定义（克隆失败的情况）
+                pass
+            except Exception as e:
+                logger.warning(f"Failed to remove repo: {e}")
 
 
-def main(swe_bench_path: str, coverage_graph_path: str, output_dir: str = 'historical_information'):
+# 方案三: 用于并行处理的独立函数
+def process_instance_parallel(args: Tuple[Dict, Dict, str, str]) -> Optional[str]:
+    """
+    并行处理单个实例的包装函数
+    args: (instance, coverage_graph, output_dir, log_dir)
+    """
+    instance, coverage_graph, output_dir, log_dir = args
+    
+    # 每个进程创建独立的collector，并传入instance_id以区分仓库路径
+    instance_id = instance['instance_id']
+    collector = HistoricalInfoCollector(output_dir, log_dir, instance_id)
+    
+    return collector.process_instance(instance, coverage_graph)
+
+
+def main(swe_bench_path: str, coverage_graph_path: str, output_dir: str = 'historical_information',
+         num_workers: int = None):
     """主函数"""
     print("="*80)
-    print("Historical Information Collection Tool")
+    print("Historical Information Collection Tool (Optimized)")
     print("="*80)
+    
+    # 方案三: 设置并行worker数量
+    if num_workers is None:
+        num_workers = max(1, multiprocessing.cpu_count() - 1)
+    
+    print(f"Using {num_workers} parallel workers")
     
     # 创建输出目录
     log_dir = 'logs'
-    collector = HistoricalInfoCollector(output_dir, log_dir)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
     
     # 加载SWE-bench数据
     print(f"\nLoading SWE-bench data from: {swe_bench_path}")
@@ -633,27 +750,69 @@ def main(swe_bench_path: str, coverage_graph_path: str, output_dir: str = 'histo
     # 加载coverage graphs
     coverage_graph_dir = Path(coverage_graph_path)
     
-    # 处理每个实例
-    processed = 0
+    # 准备任务列表
+    tasks = []
     for instance in test_data:
         instance_id = instance['instance_id']
         coverage_file = coverage_graph_dir / f'{instance_id}.json'
         
         if not coverage_file.exists():
-            print(f"\nSkipping {instance_id}: coverage graph not found")
+            print(f"Skipping {instance_id}: coverage graph not found")
             continue
         
         # 加载coverage graph
         with open(coverage_file, 'r') as f:
             coverage_graph = json.load(f)
         
-        print(f"\n[{processed + 1}/{len(test_data)}] Processing: {instance_id}")
-        collector.process_instance(instance, coverage_graph)
-        processed += 1
+        # 将instance转换为可序列化的字典
+        instance_dict = dict(instance)
+        tasks.append((instance_dict, coverage_graph, output_dir, log_dir))
+    
+    print(f"\nPrepared {len(tasks)} tasks for processing")
+    
+    # 方案三: 并行处理
+    processed = 0
+    failed = 0
+    
+    if num_workers > 1:
+        print(f"\nStarting parallel processing with {num_workers} workers...")
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_instance_parallel, task): task[0]['instance_id'] 
+                      for task in tasks}
+            
+            for future in as_completed(futures):
+                instance_id = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        processed += 1
+                        print(f"[{processed + failed}/{len(tasks)}] Completed: {instance_id}")
+                    else:
+                        failed += 1
+                        print(f"[{processed + failed}/{len(tasks)}] Failed: {instance_id}")
+                except Exception as e:
+                    failed += 1
+                    print(f"[{processed + failed}/{len(tasks)}] Error processing {instance_id}: {e}")
+    else:
+        # 单进程模式（方便调试）
+        print("\nStarting sequential processing...")
+        collector = HistoricalInfoCollector(output_dir, log_dir)
+        
+        for task in tasks:
+            instance, coverage_graph, _, _ = task
+            instance_id = instance['instance_id']
+            print(f"\n[{processed + failed + 1}/{len(tasks)}] Processing: {instance_id}")
+            
+            result = collector.process_instance(instance, coverage_graph)
+            if result:
+                processed += 1
+            else:
+                failed += 1
     
     print(f"\n{'='*80}")
     print(f"Processing complete!")
     print(f"Processed: {processed} instances")
+    print(f"Failed: {failed} instances")
     print(f"Results saved to: {output_dir}/")
     print(f"Logs saved to: {log_dir}/")
     print(f"{'='*80}")
@@ -661,11 +820,13 @@ def main(swe_bench_path: str, coverage_graph_path: str, output_dir: str = 'histo
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print("Usage: python collect_historical_info.py <swe_bench_path> <coverage_graph_path> [output_dir]")
+        print("Usage: python collect_historical_info_optimized.py <swe_bench_path> <coverage_graph_path> [output_dir] [num_workers]")
+        print("  num_workers: number of parallel workers (default: CPU count - 1)")
         sys.exit(1)
     
     swe_bench_path = sys.argv[1]
     coverage_graph_path = sys.argv[2]
     output_dir = sys.argv[3] if len(sys.argv) > 3 else 'historical_information'
+    num_workers = int(sys.argv[4]) if len(sys.argv) > 4 else None
     
-    main(swe_bench_path, coverage_graph_path, output_dir)
+    main(swe_bench_path, coverage_graph_path, output_dir, num_workers)
