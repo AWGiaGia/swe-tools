@@ -107,6 +107,93 @@ class PythonEntityExtractor:
         closest_line = max(valid_lines)
         return entities[closest_line]
 
+    @staticmethod
+    def extract_function_source(source: str, function_name: str) -> Optional[str]:
+        """
+        从源代码中提取特定函数的源代码
+        """
+        try:
+            tree = ast.parse(source)
+            lines = source.split('\n')
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == function_name:
+                    start_line = node.lineno - 1
+                    end_line = getattr(node, 'end_lineno', None)
+                    
+                    if end_line:
+                        return '\n'.join(lines[start_line:end_line])
+                    else:
+                        # Python 3.7以下没有end_lineno，尝试估算
+                        # 找到下一个同缩进级别的定义
+                        indent = len(lines[start_line]) - len(lines[start_line].lstrip())
+                        for i in range(start_line + 1, len(lines)):
+                            line = lines[i]
+                            if line.strip() and not line.startswith(' ' * (indent + 1)) and not line.startswith('\t'):
+                                if line.strip().startswith('def ') or line.strip().startswith('class '):
+                                    return '\n'.join(lines[start_line:i])
+                        return '\n'.join(lines[start_line:])
+            return None
+        except:
+            return None
+    
+    @staticmethod
+    def normalize_function_ast(func_source: str) -> Optional[str]:
+        """
+        将函数源代码规范化为AST字符串表示，用于语义比较
+        """
+        try:
+            tree = ast.parse(func_source)
+            # 使用ast.dump获取规范化表示，忽略行号等位置信息
+            return ast.dump(tree, annotate_fields=False)
+        except SyntaxError:
+            return None
+    
+    @staticmethod
+    def is_semantic_change(old_source: str, new_source: str, function_name: str) -> bool:
+        """
+        判断函数的修改是否是语义上的修改
+        返回True表示是语义修改，False表示只是格式/注释修改
+        """
+        old_func = PythonEntityExtractor.extract_function_source(old_source, function_name)
+        new_func = PythonEntityExtractor.extract_function_source(new_source, function_name)
+        
+        if old_func is None and new_func is None:
+            # 无法在两个版本中找到函数
+            # 可能原因：1) AST解析失败（如Python 2语法）2) 函数名匹配问题
+            # 保守处理：认为是语义修改，避免错误过滤重要commit
+            logging.debug(f"    Function '{function_name}' not found in both old and new source, assuming semantic change (conservative)")
+            return True
+        if old_func is None:
+            logging.debug(f"    Function '{function_name}' not found in old source (newly added)")
+            return True  # 函数新建，是语义修改
+        if new_func is None:
+            logging.debug(f"    Function '{function_name}' not found in new source (deleted)")
+            return True  # 函数删除，是语义修改
+        
+        old_ast = PythonEntityExtractor.normalize_function_ast(old_func)
+        new_ast = PythonEntityExtractor.normalize_function_ast(new_func)
+        
+        if old_ast is None or new_ast is None:
+            logging.debug(f"    AST parsing failed for '{function_name}', falling back to text comparison")
+            # AST解析失败，回退到简单比较（去除空白和注释）
+            old_clean = re.sub(r'#.*$', '', old_func, flags=re.MULTILINE)
+            old_clean = re.sub(r'\s+', ' ', old_clean).strip()
+            new_clean = re.sub(r'#.*$', '', new_func, flags=re.MULTILINE)
+            new_clean = re.sub(r'\s+', ' ', new_clean).strip()
+            is_different = old_clean != new_clean
+            if not is_different:
+                logging.debug(f"    Text comparison: no semantic change (whitespace/comment only)")
+            return is_different
+        
+        is_different = old_ast != new_ast
+        if not is_different:
+            logging.debug(f"    AST comparison: no semantic change (format/comment only)")
+        else:
+            logging.debug(f"    AST comparison: semantic change detected")
+        
+        return is_different
+
 
 class CommitAnalyzer:
     """分析Git commit信息"""
@@ -396,6 +483,245 @@ class GitRepoManager:
         
         return entities
     
+
+    def find_function_init_commit(self, repo_path: Path, file_path: str, function_name: str) -> Optional[Dict]:
+        """
+        查找函数首次出现的commit（使用git log -S，并验证是否为真正的init commit）
+        """
+        try:
+            search_pattern = f"def {function_name}"
+            
+            logging.debug(f"Searching init commit for function '{function_name}' in {file_path}")
+            logging.debug(f"Using search pattern: '{search_pattern}'")
+            
+            # 不使用 --follow，获取所有改变该函数定义出现次数的 commit
+            cmd = ['git', 'log', '-S', search_pattern, '--format=%H|%at|%s', '--reverse', '--', file_path]
+            logging.debug(f"Running command: {' '.join(cmd)}")
+            
+            result = subprocess.run(
+                cmd,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            
+            logging.debug(f"git log -S return code: {result.returncode}")
+            logging.debug(f"git log -S stdout: {result.stdout[:500] if result.stdout else '(empty)'}")
+            if result.stderr:
+                logging.debug(f"git log -S stderr: {result.stderr[:500]}")
+            
+            if result.returncode != 0:
+                logging.warning(f"git log -S failed for {function_name}, return code: {result.returncode}")
+                return None
+            
+            # 解析结果
+            lines = result.stdout.strip().split('\n')
+            valid_lines = [l for l in lines if l]
+            logging.debug(f"git log -S returned {len(valid_lines)} candidate commits")
+            
+            # 明显是文件/目录移动的 commit message 模式（硬证据）
+            move_patterns = [
+                r'\bmoves?\s+(project|directory|folder|files?)\b',  # "Move/Moves project/directory/folder/file"
+                r'\bmoves?\s+\S+\s+(to|from)\s+\S+',                # "Move xxx to/from yyy"
+                r'\bmoves?\s+\S+\s+(out\s+of|into)\s+\S+',          # "Moves xxx out of yyy" / "Move xxx into yyy"
+                r'\brename\s+(project|directory|folder)\b',         # "Rename project/directory/folder"
+                r'\brelocate\s+(project|directory|folder)\b',       # "Relocate project/directory/folder"
+                r'\bmigrate\s+(project|directory|folder)\b',        # "Migrate project/directory/folder"
+            ]
+            
+            # 验证每个候选 commit，找到真正首次引入函数的 commit
+            for line in valid_lines:
+                parts = line.split('|', 2)
+                if len(parts) != 3:
+                    continue
+                    
+                commit_hash, timestamp, message = parts
+                message_lower = message.lower()
+                
+                # 检查是否是明显的文件移动 commit（基于 commit message）
+                is_move_commit = any(re.search(pattern, message_lower) for pattern in move_patterns)
+                if is_move_commit:
+                    # commit message 表明是文件移动，但可能同时新增了函数，需要检查 diff
+                    diff_result = subprocess.run(
+                        ['git', 'show', '--format=', commit_hash, '--', file_path],
+                        cwd=repo_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    
+                    if diff_result.returncode == 0:
+                        has_added_func_def = any(
+                            line.startswith('+') and f"def {function_name}" in line and not line.startswith('+++')
+                            for line in diff_result.stdout.split('\n')
+                        )
+                        
+                        if has_added_func_def:
+                            logging.debug(f"Commit {commit_hash[:8]} is file move but has '+def {function_name}' in diff, treating as init")
+                        else:
+                            logging.debug(f"Skipping commit {commit_hash[:8]}: commit message indicates file move and no '+def {function_name}' in diff - '{message[:60]}'")
+                            continue
+                    else:
+                        logging.debug(f"Skipping commit {commit_hash[:8]}: commit message indicates file move - '{message[:60]}'")
+                        continue
+                
+                # 获取 commit 前后的文件内容
+                old_content = self.get_file_content_at_commit(repo_path, f'{commit_hash}^', file_path)
+                new_content = self.get_file_content_at_commit(repo_path, commit_hash, file_path)
+                
+                # 如果 old_content 为 None，需要检查是文件新建还是文件移动
+                if old_content is None:
+                    # 检查文件在这个 commit 中的状态（A=Added, R=Renamed, M=Modified 等）
+                    status_result = subprocess.run(
+                        ['git', 'show', '--name-status', '--format=', commit_hash],
+                        cwd=repo_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    if status_result.returncode == 0:
+                        # 检测是否是 Rename
+                        is_rename = any(file_path in status_line and status_line.startswith('R') 
+                                    for status_line in status_result.stdout.strip().split('\n'))
+                        
+                        if is_rename:
+                            # 文件是 Rename 过来的，需要进一步检查 diff 中是否真的新增了该函数定义
+                            diff_result = subprocess.run(
+                                ['git', 'show', '--format=', commit_hash, '--', file_path],
+                                cwd=repo_path,
+                                capture_output=True,
+                                text=True,
+                                timeout=60
+                            )
+                            
+                            if diff_result.returncode == 0:
+                                # 检查是否有 "+def function_name" 行
+                                has_added_func_def = any(
+                                    line.startswith('+') and f"def {function_name}" in line and not line.startswith('+++')
+                                    for line in diff_result.stdout.split('\n')
+                                )
+                                
+                                if has_added_func_def:
+                                    logging.debug(f"Commit {commit_hash[:8]} is Rename but has '+def {function_name}' in diff, treating as init")
+                                else:
+                                    logging.debug(f"Skipping commit {commit_hash[:8]}: file was renamed and no '+def {function_name}' in diff")
+                                    continue
+                            else:
+                                logging.debug(f"Skipping commit {commit_hash[:8]}: file was renamed/moved")
+                                continue
+                
+                old_has_func = old_content is not None and search_pattern in old_content
+                new_has_func = new_content is not None and search_pattern in new_content
+                
+                logging.debug(f"Validating commit {commit_hash[:8]}: old_has_func={old_has_func}, new_has_func={new_has_func}")
+                
+                if not old_has_func and new_has_func:
+                    # 额外验证1：用 git grep 检查函数是否在 commit 之前就已存在于仓库中（任意位置）
+                    grep_result = subprocess.run(
+                        ['git', 'grep', '-l', search_pattern, f'{commit_hash}^', '--', '*.py'],
+                        cwd=repo_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    
+                    if grep_result.returncode == 0 and grep_result.stdout.strip():
+                        existing_files = grep_result.stdout.strip().split('\n')
+                        logging.debug(f"Skipping commit {commit_hash[:8]}: function '{function_name}' already exists in repo before this commit")
+                        logging.debug(f"  Existing locations: {existing_files[:5]}")
+                        continue
+                    
+                    # 额外验证2：大规模 commit（修改文件数 > 阈值）不太可能是单个函数的 init commit
+                    files_in_commit = self.get_files_in_commit(repo_path, commit_hash)
+                    if len(files_in_commit) > 50:
+                        logging.debug(f"Skipping commit {commit_hash[:8]}: too many files changed ({len(files_in_commit)}), likely a large refactor/migration")
+                        continue
+                    
+                    # 额外验证3（最终防线）：直接检查 diff 中是否真的有 "+def function_name(" 行
+                    diff_result = subprocess.run(
+                        ['git', 'show', '--format=', commit_hash, '--', file_path],
+                        cwd=repo_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    
+                    if diff_result.returncode == 0:
+                        has_added_func_def = any(
+                            ln.startswith('+') and f"def {function_name}(" in ln and not ln.startswith('+++')
+                            for ln in diff_result.stdout.split('\n')
+                        )
+                        
+                        if not has_added_func_def:
+                            logging.debug(f"Skipping commit {commit_hash[:8]}: no '+def {function_name}(' line found in diff (function was moved, not created)")
+                            continue
+                    else:
+                        logging.debug(f"Skipping commit {commit_hash[:8]}: failed to get diff for final verification")
+                        continue
+                    
+                    # 真正的 init commit：通过所有验证
+                    init_commit = {
+                        'commit_hash': commit_hash,
+                        'timestamp': datetime.fromtimestamp(int(timestamp)).isoformat() + 'Z',
+                        'commit_message': message,
+                        'commit_type': CommitAnalyzer.extract_commit_type(message)
+                    }
+                    logging.info(f"Found verified init commit for '{function_name}': {commit_hash[:8]} - {message[:60]}")
+                    return init_commit
+
+                    # note
+
+                else:
+                    # 可能是文件移动或其他情况，跳过继续检查下一个
+                    logging.debug(f"Skipping commit {commit_hash[:8]}: not a true init (old_has={old_has_func}, new_has={new_has_func})")
+            
+            logging.warning(f"No verified init commit found for function '{function_name}' in {file_path}")
+            return None
+            
+        except subprocess.TimeoutExpired:
+            logging.error(f"Timeout while searching init commit for {function_name}")
+            return None
+        except Exception as e:
+            logging.warning(f"Failed to find init commit for {function_name}: {e}")
+            return None
+
+
+    def is_semantic_modification(self, repo_path: Path, commit_hash: str, 
+                                    file_path: str, function_name: str) -> bool:
+        """
+        检查commit对指定函数是否是语义上的修改（而非仅格式修改）
+        """
+        try:
+            logging.debug(f"Checking semantic modification for '{function_name}' in commit {commit_hash[:8]}")
+            
+            old_content = self.get_file_content_at_commit(repo_path, f'{commit_hash}^', file_path)
+            new_content = self.get_file_content_at_commit(repo_path, commit_hash, file_path)
+            
+            if old_content is None and new_content is None:
+                logging.debug(f"  Both old and new content are None, not a semantic change")
+                return False
+            if old_content is None:
+                logging.debug(f"  Old content is None (file created), is semantic change")
+                return True
+            if new_content is None:
+                logging.debug(f"  New content is None (file deleted), is semantic change")
+                return True
+            
+            is_semantic = PythonEntityExtractor.is_semantic_change(old_content, new_content, function_name)
+            
+            if is_semantic:
+                logging.debug(f"  Commit {commit_hash[:8]} IS a semantic modification to '{function_name}'")
+            else:
+                logging.debug(f"  Commit {commit_hash[:8]} is NOT a semantic modification to '{function_name}' (format/comment only)")
+            
+            return is_semantic
+            
+        except Exception as e:
+            logging.debug(f"Failed to check semantic modification for {function_name} in {commit_hash[:8]}: {e}")
+            return True  # 出错时保守处理，认为是语义修改
+    
     def clear_cache(self):
         """清理缓存"""
         self._file_content_cache.clear()
@@ -487,6 +813,7 @@ class HistoricalInfoCollector:
         result = {
             'test_function': test_function,
             'covered_entities': covered_entities,
+            'init_commit': None,  # 新增：测试函数的初始commit
             'co_modifications': [],
             'test_modification_history': [],
             'co_occurrence_timeline': {},
@@ -515,6 +842,50 @@ class HistoricalInfoCollector:
         # 获取测试文件的commit历史
         test_commits = self.git_manager.get_commit_history(repo_path, test_file)
         logger.info(f"Found {len(test_commits)} commits for test file")
+        
+        # 解析测试函数名（用于查找init commit和语义过滤）
+        test_func_name = test_function.split('::')[-1] if '::' in test_function else None
+        
+        # 查找测试函数的init commit
+        if test_func_name:
+            init_commit = self.git_manager.find_function_init_commit(repo_path, test_file, test_func_name)
+            result['init_commit'] = init_commit
+            if init_commit:
+                logger.info(f"Found init commit for {test_func_name}: {init_commit['commit_hash'][:8]}")
+            else:
+                logger.warning(f"Could not find init commit for {test_func_name}")
+        
+        # 过滤非语义修改的commit
+        if test_func_name:
+            logger.info(f"Starting semantic filtering for {len(test_commits)} commits...")
+            semantic_commits = []
+            filtered_commits = []
+            
+            for commit_info in test_commits:
+                commit_hash = commit_info['commit_hash']
+                commit_msg = commit_info['commit_message']
+                
+                is_semantic = self.git_manager.is_semantic_modification(repo_path, commit_hash, test_file, test_func_name)
+                
+                if is_semantic:
+                    semantic_commits.append(commit_info)
+                    logger.debug(f"KEPT semantic commit: {commit_hash[:8]} - {commit_msg[:60]}")
+                else:
+                    filtered_commits.append(commit_info)
+                    logger.info(f"FILTERED non-semantic commit: {commit_hash[:8]} - {commit_msg[:60]}")
+            
+            # 汇总日志
+            logger.info(f"Semantic filtering complete:")
+            logger.info(f"  - Total commits analyzed: {len(test_commits)}")
+            logger.info(f"  - Semantic commits (kept): {len(semantic_commits)}")
+            logger.info(f"  - Non-semantic commits (filtered): {len(filtered_commits)}")
+            
+            if filtered_commits:
+                logger.info(f"  - Filtered commits list:")
+                for fc in filtered_commits:
+                    logger.info(f"      {fc['commit_hash'][:8]} | {fc['timestamp'][:10]} | {fc['commit_message'][:50]}")
+            
+            test_commits = semantic_commits
         
         result['test_modification_history'] = test_commits
         result['statistics']['total_test_modifications'] = len(test_commits)
