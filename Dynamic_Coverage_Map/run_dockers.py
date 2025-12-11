@@ -37,7 +37,8 @@ class DockerBatchRunner:
         script_dir: str,
         result_base_dir: str,
         image_prefix: str = "swebench/sweb.eval.x86_64.scikit-learn_1776",
-        log_dir: str = "./logs"
+        log_dir: str = "./logs",
+        parallel: int = 1  # 新增参数
     ):
         """
         初始化批量执行器
@@ -53,7 +54,10 @@ class DockerBatchRunner:
         self.image_prefix = image_prefix
         self.log_dir = os.path.abspath(log_dir)
         self.last_run_skipped = False
-        
+        self.log_dir = os.path.abspath(log_dir)
+        self.last_run_skipped = False
+        self.parallel = parallel  # 新增：保存并行度
+
         # 创建日志目录
         os.makedirs(self.log_dir, exist_ok=True)
         
@@ -327,13 +331,25 @@ class DockerBatchRunner:
             
             # 执行命令序列
             # 使用 conda run 在 testbed 环境中执行命令，确保使用正确的 Python 版本
+            # commands = [
+            #     # 在 testbed 环境中安装依赖
+            #     "conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && pip install pytest-json-report pytest-cov'",
+            #     # 在 testbed 环境中运行脚本
+            #     "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
+            # ]
+            
+            # 为了修补pytest仓库上的运行问题，而进行的兼容修改
             commands = [
-                # 在 testbed 环境中安装依赖
-                "conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && pip install pytest-json-report pytest-cov'",
-                # 在 testbed 环境中运行脚本
+                # 步骤1：检测是否存在pytest源码
+                r"test -f /testbed/src/_pytest/__init__.py && echo 'has_pytest_src' > /tmp/pytest_check.txt || echo 'no_pytest_src' > /tmp/pytest_check.txt",
+                
+                # 步骤2：根据检测结果安装依赖
+                r"""conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; CHECK=$(cat /tmp/pytest_check.txt); if [ "$CHECK" = "has_pytest_src" ]; then echo 检测到testbed中有pytest源码,安装兼容旧版本的插件; pip install pytest-json-report==1.5.0 pytest-metadata==2.0.4 pytest-cov==2.12.1; else echo 未检测到pytest源码,使用默认安装; pip install pytest-json-report pytest-cov; fi'""",
+                
+                # 步骤3：运行脚本
                 "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
             ]
-            
+
             for i, cmd in enumerate(commands, 1):
                 log.info(f"执行命令 {i}/{len(commands)}: {cmd[:80]}...")
                 
@@ -349,11 +365,20 @@ class DockerBatchRunner:
                     stdout_output = output[0].decode('utf-8') if output[0] else ""
                     stderr_output = output[1].decode('utf-8') if output[1] else ""
                     
-                    # 记录输出
-                    if stdout_output:
-                        log.debug(f"STDOUT:\n{stdout_output}")
-                    if stderr_output:
-                        log.debug(f"STDERR:\n{stderr_output}")
+                    # 对于最后一个命令（trace.py执行），记录更详细的信息
+                    if i == len(commands):
+                        log.info(f"========== trace.py执行输出（完整） ==========")
+                        if stdout_output:
+                            log.info(f"STDOUT:\n{stdout_output}")
+                        if stderr_output:
+                            log.info(f"STDERR:\n{stderr_output}")
+                        log.info(f"=" * 60)
+                    else:
+                        # 其他命令保持原有的DEBUG级别
+                        if stdout_output:
+                            log.debug(f"STDOUT:\n{stdout_output}")
+                        if stderr_output:
+                            log.debug(f"STDERR:\n{stderr_output}")
                     
                     if exit_code != 0:
                         log.error(f"命令执行失败 (退出码: {exit_code})")
@@ -407,6 +432,9 @@ class DockerBatchRunner:
         Args:
             max_containers: 最大处理容器数量，None表示处理所有
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
         images = self.get_target_images()
         
         if not images:
@@ -420,33 +448,79 @@ class DockerBatchRunner:
             images = images[:max_containers]
             self.logger.info(f"--max 参数设置为 {max_containers}，本次将处理 {total}/{original_total} 个镜像")
         
+        # 确定实际并行度
+        actual_parallel = min(self.parallel, total)
+        
         self.logger.info(f"\n{'='*60}")
         self.logger.info(f"开始批量处理，共 {total} 个镜像")
+        if actual_parallel > 1:
+            self.logger.info(f"并行度: {actual_parallel} 个容器同时处理")
+        else:
+            self.logger.info(f"串行模式（并行度: 1）")
         self.logger.info(f"{'='*60}\n")
         
+        # 线程安全的计数器
         success_count = 0
         failed_count = 0
         skipped_count = 0
+        count_lock = threading.Lock()
         
         start_time = time.time()
         
-        for idx, image_info in enumerate(images, 1):
+        def process_image_wrapper(idx_and_info):
+            """包装函数，用于并行执行"""
+            idx, image_info = idx_and_info
+            nonlocal success_count, failed_count, skipped_count
+            
             instance_id = self._extract_instance_identifier(image_info['tag'])
-            instance_log_file = os.path.join(self.batch_log_dir, f"{self._sanitize_instance_id(instance_id)}.log")
+            instance_log_file = os.path.join(
+                self.batch_log_dir, 
+                f"{self._sanitize_instance_id(instance_id)}.log"
+            )
+            
             self.logger.info(f"\n进度: [{idx}/{total}] - 实例: {instance_id}")
             
             result = self.run_in_container(image_info)
             
-            if result:
-                if self.last_run_skipped:
-                    skipped_count += 1
-                    self.logger.info(f"实例 {instance_id} 已跳过，日志: {instance_log_file}")
+            # 线程安全地更新计数器
+            with count_lock:
+                if result:
+                    if self.last_run_skipped:
+                        skipped_count += 1
+                        self.logger.info(f"实例 {instance_id} 已跳过，日志: {instance_log_file}")
+                    else:
+                        success_count += 1
+                        self.logger.info(f"实例 {instance_id} 处理完成，日志: {instance_log_file}")
                 else:
-                    success_count += 1
-                    self.logger.info(f"实例 {instance_id} 处理完成，日志: {instance_log_file}")
-            else:
-                failed_count += 1
-                self.logger.error(f"实例 {instance_id} 处理失败，详见日志: {instance_log_file}")
+                    failed_count += 1
+                    self.logger.error(f"实例 {instance_id} 处理失败，详见日志: {instance_log_file}")
+            
+            return result
+        
+        # 串行或并行处理
+        if actual_parallel == 1:
+            # 串行模式（保持原有行为）
+            for idx, image_info in enumerate(images, 1):
+                process_image_wrapper((idx, image_info))
+        else:
+            # 并行模式
+            with ThreadPoolExecutor(max_workers=actual_parallel) as executor:
+                # 提交所有任务
+                futures = {
+                    executor.submit(process_image_wrapper, (idx, image_info)): (idx, image_info)
+                    for idx, image_info in enumerate(images, 1)
+                }
+                
+                # 等待完成（保持提交顺序的进度显示）
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        idx, image_info = futures[future]
+                        instance_id = self._extract_instance_identifier(image_info['tag'])
+                        self.logger.error(f"处理实例 {instance_id} 时发生未捕获异常: {e}", exc_info=True)
+                        with count_lock:
+                            failed_count += 1
         
         # 统计总结
         elapsed_time = time.time() - start_time
@@ -459,10 +533,11 @@ class DockerBatchRunner:
         self.logger.info(f"⏭️  跳过: {skipped_count}")
         self.logger.info(f"❌ 失败: {failed_count}")
         self.logger.info(f"⏱️  总耗时: {elapsed_time:.2f} 秒 ({elapsed_time/60:.2f} 分钟)")
+        if actual_parallel > 1:
+            self.logger.info(f"⚡ 平均每个容器: {elapsed_time/total:.2f} 秒")
         
         if failed_count > 0:
             self.logger.warning(f"\n有 {failed_count} 个镜像处理失败，请查看日志文件了解详情")
-
 
 def main():
     """主函数"""
@@ -512,7 +587,14 @@ def main():
         default=None,
         help='最大处理镜像数量（用于测试，默认处理所有镜像）'
     )
-    
+
+    parser.add_argument(
+        '--parallel',
+        type=int,
+        default=8,
+        help='并行处理的容器数量（默认: 1，建议: 4-8）'
+    )
+
     args = parser.parse_args()
     
     # 验证目录存在
@@ -525,7 +607,8 @@ def main():
         script_dir=args.script_dir,
         result_base_dir=args.result_dir,
         image_prefix=args.image_prefix,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        parallel=args.parallel  # 新增参数
     )
     
     runner.run_batch(max_containers=args.max)

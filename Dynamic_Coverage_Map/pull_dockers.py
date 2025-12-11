@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+# pull_dockers.py
 """
 SWE-bench Docker镜像批量下载工具
 支持使用前缀过滤并批量下载Docker Hub上的swebench镜像
