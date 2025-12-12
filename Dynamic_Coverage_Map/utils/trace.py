@@ -951,6 +951,12 @@ def trace_test(test: str, cwd: str, temp_dir: str) -> None:
             for ignore_dir in pytest_ignore_list:
                 pytest_args.append(f"--ignore={ignore_dir}")
 
+            # 检查是否需要禁用 doctestplus 插件（与 collect_tests 保持一致）
+            marker_file = Path("/workspace/result/doctestplus_disabled.marker")
+            if marker_file.exists():
+                printf(f"[trace_test] 检测到 doctestplus 已在收集阶段被禁用，继续禁用")
+                pytest_args.extend(["-p", "no:doctestplus"])
+
             printf(f"[trace_test] pytest参数数量: {len(pytest_args)}")
             trace_file = f"{_temp_dir}/trace.json"
             printf(f"[trace_test] 跟踪文件路径: {trace_file}")
