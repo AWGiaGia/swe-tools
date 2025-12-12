@@ -401,9 +401,17 @@ def clear_python_cache(dir: str) -> None:
                 shutil.rmtree(os.path.join(root, dir))
 
 
-def run_pytest(cwd: str, pytest_args: List[str]) -> None:
+def run_pytest(cwd: str, pytest_args: List[str], raise_on_error: bool = True) -> Optional[str]:
     """
     Run pytest with the given arguments.
+    
+    Args:
+        cwd: 工作目录
+        pytest_args: pytest参数列表
+        raise_on_error: 如果为False，失败时返回错误信息而不抛异常
+        
+    Returns:
+        如果失败且raise_on_error=False，返回错误信息；否则返回None
     """
     printf(f"\n[run_pytest] 开始执行pytest")
     printf(f"[run_pytest] 工作目录: {cwd}")
@@ -591,6 +599,9 @@ def run_pytest(cwd: str, pytest_args: List[str]) -> None:
             else:
                 printf(f"[run_pytest] ⚠️  无法从输出中提取收集的测试数量")
                 printf(f"[run_pytest] 这可能表示测试收集完全失败")
+                # 返回错误信息供调用者判断
+                if not raise_on_error:
+                    return stdout_text + "\n" + stderr_text
             
             printf(f"ℹ️  Continuing with successfully collected tests...")
             printf("─" * 60)
@@ -603,10 +614,14 @@ def run_pytest(cwd: str, pytest_args: List[str]) -> None:
             printf(f"[run_pytest] STDERR (前500字符):\n{stderr_text[:500]}")
             printf(f"pytest output:\n{stdout_text}")
             printf(f"pytest error:\n{stderr_text}")
-            raise Exception(f"pytest failed with return code {result.returncode}")
+            
+            if raise_on_error:
+                raise Exception(f"pytest failed with return code {result.returncode}")
+            else:
+                return stdout_text + "\n" + stderr_text
     else:
         printf(f"[run_pytest] ✅ pytest执行成功")
-
+        return None
 def collect_tests(
     project_root: str,
     output_dir: str,
@@ -650,9 +665,46 @@ def collect_tests(
     # print("cwd = {}".format(cwd))
     # print("pytest_args = {}".format(pytest_args))
 
-    run_pytest(cwd=cwd, pytest_args=pytest_args)
+    # 第一次尝试：使用标准配置收集测试
+    printf(f"[collect_tests] 第一次尝试：使用标准配置收集测试")
+    error_info = run_pytest(cwd=cwd, pytest_args=pytest_args, raise_on_error=False)
+    
+    # 检查是否因为 pytest-doctestplus 失败
+    if error_info and "pytest_doctestplus" in error_info.lower():
+        printf(f"\n[collect_tests] ⚠️  检测到 pytest-doctestplus 插件导致收集失败")
+        printf(f"[collect_tests] 尝试禁用 pytest-doctestplus 插件后重试...")
+        
+        # 添加禁用插件的参数
+        retry_args = pytest_args.copy()
+        retry_args.extend(["-p", "no:doctestplus"])
+        
+        # 第二次尝试
+        printf(f"[collect_tests] 第二次尝试：禁用 doctestplus 插件")
+        error_info_retry = run_pytest(cwd=cwd, pytest_args=retry_args, raise_on_error=False)
+        
+        if error_info_retry:
+            # 还是失败，记录并继续
+            printf(f"[collect_tests] ❌ 禁用插件后仍然失败")
+            printf(f"[collect_tests] 将尝试使用已收集的测试继续...")
+        else:
+            printf(f"[collect_tests] ✅ 禁用插件后收集成功！")
+            # 创建标记文件记录使用了降级方案
+            try:
+                marker_file = Path(_output_dir) / "doctestplus_disabled.marker"
+                with open(marker_file, 'w') as f:
+                    f.write("pytest-doctestplus plugin was disabled due to compatibility issues\n")
+                printf(f"[collect_tests] 已创建标记文件: {marker_file}")
+            except Exception as e:
+                printf(f"[collect_tests] ⚠️  创建标记文件失败: {e}")
 
-    report = json.load(open(Path(_output_dir) / report_file))
+    # 读取收集结果
+    report_path = Path(_output_dir) / report_file
+    if not report_path.exists():
+        printf(f"[collect_tests] ⚠️  JSON报告不存在: {report_path}")
+        printf(f"[collect_tests] 可能没有收集到任何测试")
+        return []
+    
+    report = json.load(open(report_path))
     collectors = report['collectors']
     tests = []
     for collector in collectors:
