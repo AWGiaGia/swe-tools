@@ -44,6 +44,159 @@ def detect_django_settings(project_root: str) -> Optional[str]:
     
     printf(f"[Django检测] 开始检测项目: {project_root}")
     
+# ===== 0. 特殊处理：检测是否为 Django 源码仓库本身 =====
+    is_django_source_repo = (
+        (project_path / "tests" / "runtests.py").exists() and
+        (project_path / "django" / "__init__.py").exists()
+    )
+    
+    if is_django_source_repo:
+        printf(f"[Django检测] ✅ 检测到 Django 源码仓库")
+        
+        # 优先尝试使用官方测试设置文件
+        official_settings_candidates = [
+            (project_path / "tests" / "test_sqlite.py", "test_sqlite"),
+            (project_path / "tests" / "test_settings.py", "test_settings"),
+            (project_path / "tests" / "settings.py", "settings"),
+        ]
+        
+        for settings_file, settings_module in official_settings_candidates:
+            if settings_file.exists():
+                printf(f"[Django检测] ✅ 找到官方测试设置: {settings_file} -> {settings_module}")
+                return settings_module
+        
+        # 官方设置不存在时，创建兼容的临时设置
+        printf(f"[Django检测] ⚠️ 未找到官方测试设置，创建临时 settings")
+        temp_settings_path = project_path / "_trace_test_settings.py"
+        temp_settings_content = '''\
+# Auto-generated settings for Django source repo testing
+# This is a fallback when official test settings are not found
+import os
+import warnings
+
+# 基础安全配置
+SECRET_KEY = 'django-insecure-test-key-for-trace-collection-only'
+
+# 数据库配置 - 与官方测试一致
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ':memory:',
+    },
+    'other': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ':memory:',
+    },
+}
+
+# 核心应用
+INSTALLED_APPS = [
+    'django.contrib.contenttypes',
+    'django.contrib.auth',
+    'django.contrib.sites',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.admin.apps.SimpleAdminConfig',
+    'django.contrib.staticfiles',
+    'django.contrib.redirects',
+    'django.contrib.flatpages',
+    'django.contrib.sitemaps',
+    'django.contrib.syndication',
+    'django.contrib.humanize',
+]
+
+# 尝试添加 postgres 支持（如果可用）
+try:
+    import psycopg2
+    INSTALLED_APPS.append('django.contrib.postgres')
+except ImportError:
+    pass
+
+SITE_ID = 1
+USE_TZ = False  # 与大多数 Django 测试默认行为一致
+USE_I18N = True
+LANGUAGE_CODE = 'en-us'
+DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
+
+# 加快密码哈希以加速测试
+PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+
+# 模板配置
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+# 中间件
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+]
+
+# 静态文件配置
+STATIC_URL = '/static/'
+STATIC_ROOT = os.path.join(os.path.dirname(__file__), 'static_collected')
+STATICFILES_FINDERS = [
+    'django.contrib.staticfiles.finders.FileSystemFinder',
+    'django.contrib.staticfiles.finders.AppDirectoriesFinder',
+]
+
+# URL 配置 - 使用空的 urlpatterns
+ROOT_URLCONF = ''
+
+# 日志配置 - 提供基本的 handler 避免 IndexError
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'WARNING',
+    },
+    'loggers': {
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+    },
+}
+
+DEBUG = True
+ALLOWED_HOSTS = ['*']
+
+# 警告过滤 - 将弃用警告转为错误（与官方测试行为一致）
+warnings.filterwarnings('error', category=DeprecationWarning)
+warnings.filterwarnings('error', category=PendingDeprecationWarning)
+'''
+        try:
+            with open(temp_settings_path, 'w', encoding='utf-8') as f:
+                f.write(temp_settings_content)
+            printf(f"[Django检测] ✅ 创建临时 settings 文件: {temp_settings_path}")
+            return "_trace_test_settings"
+        except Exception as e:
+            printf(f"[Django检测] ❌ 创建临时 settings 失败: {e}")
+            # 继续尝试其他方法
+    
     # ===== 1. 基础检测：检查是否为Django项目 =====
     has_manage_py = (project_path / "manage.py").exists()
     printf(f"[Django检测] 根目录manage.py存在: {has_manage_py}")
@@ -262,7 +415,27 @@ def run_pytest(cwd: str, pytest_args: List[str]) -> None:
 
     # set environment variable
     env = os.environ.copy()
-    env["PYTHONPATH"] = f"{cwd}/src:{env.get('PYTHONPATH', '')}"
+    # 清除无效的代理配置，避免 LocationParseError
+    for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 
+                    'ftp_proxy', 'FTP_PROXY', 'no_proxy', 'NO_PROXY']:
+        env.pop(proxy_var, None)
+    
+    # 构建 PYTHONPATH
+    pythonpath_parts = [f"{cwd}/src", str(cwd)]
+    
+    # 仅对 Django 源码仓库添加 tests 目录到 PYTHONPATH
+    is_django_source = (
+        (Path(cwd) / "tests" / "runtests.py").exists() and
+        (Path(cwd) / "django" / "__init__.py").exists()
+    )
+    if is_django_source and (Path(cwd) / "tests").is_dir():
+        pythonpath_parts.insert(0, f"{cwd}/tests")
+        printf(f"[run_pytest] 检测到 Django 源码仓库，添加 tests 到 PYTHONPATH")
+    
+    existing_pythonpath = env.get('PYTHONPATH', '')
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    env["PYTHONPATH"] = ":".join(pythonpath_parts)
     env["SETUPTOOLS_USE_DISTUTILS"] = "local"
     printf(f"[run_pytest] PYTHONPATH: {env['PYTHONPATH']}")
     
@@ -488,9 +661,27 @@ def run_trace_test(cwd: str, pytest_args: List[str], trace_file: str, timeout: i
 
     # set environment variable
     env = os.environ.copy()
-    env["PYTHONPATH"] = f"{cwd}/src:{env.get('PYTHONPATH', '')}"
+    # 清除无效的代理配置，避免 LocationParseError
+    for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
+                    'ftp_proxy', 'FTP_PROXY', 'no_proxy', 'NO_PROXY']:
+        env.pop(proxy_var, None)
+    
+    # 构建 PYTHONPATH
+    pythonpath_parts = [f"{cwd}/src", str(cwd)]
+    
+    # 仅对 Django 源码仓库添加 tests 目录到 PYTHONPATH
+    is_django_source = (
+        (Path(cwd) / "tests" / "runtests.py").exists() and
+        (Path(cwd) / "django" / "__init__.py").exists()
+    )
+    if is_django_source and (Path(cwd) / "tests").is_dir():
+        pythonpath_parts.insert(0, f"{cwd}/tests")
+    
+    existing_pythonpath = env.get('PYTHONPATH', '')
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    env["PYTHONPATH"] = ":".join(pythonpath_parts)
     env["SETUPTOOLS_USE_DISTUTILS"] = "local"
-    printf(f"[run_trace_test] PYTHONPATH: {env['PYTHONPATH']}")
     
     # Django项目特殊处理
     django_settings = detect_django_settings(cwd)
@@ -566,6 +757,21 @@ def trace_test(test: str, cwd: str, temp_dir: str) -> None:
         with TemporaryDirectory(dir=temp_dir) as _temp_dir:
             printf(f"[trace_test] 临时目录: {_temp_dir}")
 
+            # pytest_args = [
+            #     "--cache-clear",
+            #     f"--rootdir={cwd}",
+            #     "-o",
+            #     f"cache_dir={_temp_dir}/.pytest_cache",
+            #     "--no-cov",
+            #     "--json-report",
+            #     "--json-report-indent=4",
+            #     f"--json-report-file={_temp_dir}/report.json",
+            #     "--tb=short",  # 修改：显示简短的traceback（从 --tb=no 改为 --tb=short）
+            #     "-v",          # 修改：详细模式（从 -q 改为 -v）
+            #     "-s",          # 新增：显示print输出
+            #     test,
+            # ]
+
             pytest_args = [
                 "--cache-clear",
                 f"--rootdir={cwd}",
@@ -575,10 +781,13 @@ def trace_test(test: str, cwd: str, temp_dir: str) -> None:
                 "--json-report",
                 "--json-report-indent=4",
                 f"--json-report-file={_temp_dir}/report.json",
-                "--tb=no",
-                "-q",
+                "--tb=long",   # 完整的traceback
+                "-vv",         # 非常详细的模式
+                "-s",          # 显示print输出
+                "--showlocals", # 显示局部变量
                 test,
             ]
+
 
             # 添加忽略参数
             for ignore_dir in pytest_ignore_list:
@@ -606,6 +815,18 @@ def trace_test(test: str, cwd: str, temp_dir: str) -> None:
             test_result = test_report['tests'][0]
             outcome = test_result.get('outcome', 'unknown')
             printf(f"[trace_test] 测试结果: {outcome}")
+            
+            # passed: 正常执行并通过，收集覆盖信息
+            # skipped: pytest 正常跳过（如缺少依赖），不视为失败
+            # failed/error: 真正的失败，跳过覆盖收集
+            if outcome == 'skipped':
+                printf(f"[trace_test] ⏭️  测试被跳过（依赖缺失等）: {test}")
+                return {
+                    "test-id": test,
+                    "test-func-id": get_test_func_id(test_result),
+                    "call-relations": [],
+                    "status": "skipped"
+                }
             
             if outcome != 'passed':
                 printf(f"[trace_test] ⚠️  测试未通过，跳过: {test}")
@@ -703,24 +924,31 @@ def generate_test_traces(
         futures = {executor.submit(trace_test, test, cwd, temp_dir): test for test in tests}
         printf(f"[generate_test_traces] 已提交 {len(futures)} 个任务")
         
+        skipped_tests = []  # 新增：单独统计跳过的测试
+        
         count = 0
         for future in as_completed(futures):
             test_name = futures[future]
             try:
                 result = future.result()
                 if result:
-                    traces.append(result)
-                    printf(f"[generate_test_traces] ✅ 测试成功: {test_name}")
+                    # 区分 skipped 和正常通过的测试
+                    if result.get("status") == "skipped":
+                        skipped_tests.append(test_name)
+                        printf(f"[generate_test_traces] ⏭️  测试跳过: {test_name}")
+                    else:
+                        traces.append(result)
+                        printf(f"[generate_test_traces] ✅ 测试成功: {test_name}")
                 else:
                     failed_tests.append(test_name)
-                    printf(f"[generate_test_traces] ⚠️  测试失败或跳过: {test_name}")
+                    printf(f"[generate_test_traces] ⚠️  测试失败: {test_name}")
             except Exception as e:
                 failed_tests.append(test_name)
                 printf(f"[generate_test_traces] ❌ 测试异常: {test_name} - {e}")
             
             count += 1
-            if count % 10 == 0 or count == len(tests):  # 每10个或最后一个输出进度
-                printf(f"[generate_test_traces] 进度: {count}/{len(tests)} (成功: {len(traces)}, 失败: {len(failed_tests)})")
+            if count % 10 == 0 or count == len(tests):
+                printf(f"[generate_test_traces] 进度: {count}/{len(tests)} (成功: {len(traces)}, 跳过: {len(skipped_tests)}, 失败: {len(failed_tests)})")
 
     # clear python cache
         printf(f"[generate_test_traces] 清理Python缓存...")
@@ -729,9 +957,23 @@ def generate_test_traces(
         printf(f"[generate_test_traces] ========== 统计信息 ==========")
         printf(f"[generate_test_traces] 总测试数: {len(tests)}")
         printf(f"[generate_test_traces] 成功生成: {len(traces)}")
-        printf(f"[generate_test_traces] 失败/跳过: {len(failed_tests)}")
-        printf(f"[generate_test_traces] 成功率: {len(traces)/len(tests)*100:.2f}%")
+        printf(f"[generate_test_traces] 跳过（依赖缺失）: {len(skipped_tests)}")
+        printf(f"[generate_test_traces] 失败: {len(failed_tests)}")
+        effective_total = len(tests) - len(skipped_tests)
+        if effective_total > 0:
+            printf(f"[generate_test_traces] 有效成功率: {len(traces)/effective_total*100:.2f}% (排除跳过)")
         printf(f"Generated {len(traces)} traces")
+        
+        # 保存跳过的测试列表
+        if skipped_tests:
+            skipped_tests_file = Path(output_dir) / "skipped_tests.txt"
+            try:
+                with open(skipped_tests_file, 'w', encoding='utf-8') as f:
+                    for i, skipped_test in enumerate(skipped_tests, 1):
+                        f.write(f"{i}. {skipped_test}\n")
+                printf(f"[generate_test_traces] 跳过测试列表已保存到: {skipped_tests_file}")
+            except Exception as e:
+                printf(f"[generate_test_traces] ⚠️  保存跳过测试列表失败: {e}")
         
         # 生成失败测试报告
         if failed_tests:
@@ -754,6 +996,15 @@ def generate_test_traces(
                 printf(f"[generate_test_traces] 完整失败列表已保存到: {failed_tests_file}")
             except Exception as e:
                 printf(f"[generate_test_traces] ⚠️  保存失败测试列表失败: {e}")
+
+        # 保存测试跟踪
+        traces_file = Path(output_dir) / "traces.json"
+        try:
+            with open(traces_file, 'w', encoding='utf-8') as f:
+                json.dump(traces, f, indent=4)
+            printf(f"[generate_test_traces] 测试跟踪已保存到: {traces_file}")
+        except Exception as e:
+            printf(f"[generate_test_traces] ⚠️  保存traces.json失败: {e}")
 
 
 def main():
