@@ -466,16 +466,121 @@ def run_pytest(cwd: str, pytest_args: List[str]) -> None:
             printf(f"[run_pytest] 返回码2: 部分测试收集失败，但可以继续")
             printf(f"⚠️  pytest collection completed with some errors (return code {result.returncode})")
             
-            # 解析并记录收集失败的文件/测试
-            error_lines = [line for line in stdout_text.split('\n') if line.startswith('ERROR ')]
-            if error_lines:
-                printf(f"[run_pytest] 收集错误数量: {len(error_lines)}")
-                printf(f"📋 Collection errors found in {len(error_lines)} file(s):")
-                for i, error_line in enumerate(error_lines[:10], 1):  # 只显示前10个
-                    file_path = error_line.replace('ERROR ', '').strip()
-                    printf(f"  ❌ {file_path}")
-                if len(error_lines) > 10:
-                    printf(f"  ... 和其他 {len(error_lines) - 10} 个错误")
+            # === 新增：输出完整的 stdout 和 stderr ===
+            printf(f"\n[run_pytest] ========== 完整 STDOUT（前3000字符）==========")
+            printf(stdout_text[:3000])
+            if len(stdout_text) > 3000:
+                printf(f"\n... (总长度: {len(stdout_text)} 字符，已截断)")
+            printf(f"\n[run_pytest] ========== 完整 STDERR（前3000字符）==========")
+            printf(stderr_text[:3000])
+            if len(stderr_text) > 3000:
+                printf(f"\n... (总长度: {len(stderr_text)} 字符，已截断)")
+            printf(f"[run_pytest] ============================================\n")
+            
+            # === 改进：支持更多错误格式的提取 ===
+            error_patterns = [
+                r'^ERROR .*',           # 标准 ERROR 行
+                r'^ERROR collecting .*', # 收集错误
+                r'^INTERNALERROR.*',    # 内部错误
+                r'.*ImportError.*',     # 导入错误
+                r'.*ModuleNotFoundError.*',  # 模块未找到
+                r'^E\s+.*',             # pytest 的 E 开头错误
+            ]
+            
+            all_error_lines = []
+            for pattern in error_patterns:
+                matches = re.findall(pattern, stdout_text, re.MULTILINE)
+                all_error_lines.extend(matches)
+            
+            # 去重
+            all_error_lines = list(dict.fromkeys(all_error_lines))
+            
+            if all_error_lines:
+                printf(f"[run_pytest] 检测到 {len(all_error_lines)} 个错误行")
+                printf(f"📋 Collection errors found:")
+                for i, error_line in enumerate(all_error_lines[:15], 1):
+                    printf(f"  {i}. {error_line[:150]}")  # 每行最多显示150字符
+                if len(all_error_lines) > 15:
+                    printf(f"  ... 和其他 {len(all_error_lines) - 15} 个错误")
+            else:
+                printf(f"[run_pytest] ⚠️  未检测到明确的错误行")
+            
+            # === 新增：尝试从 JSON 报告中提取错误信息 ===
+            try:
+                report_path = None
+                # 从 pytest_args 中查找 json-report-file 参数
+                for i, arg in enumerate(pytest_args):
+                    if arg == '--json-report-file' and i + 1 < len(pytest_args):
+                        report_path = pytest_args[i + 1]
+                        break
+                
+                if report_path and os.path.exists(report_path):
+                    printf(f"[run_pytest] 尝试从 JSON 报告读取错误信息: {report_path}")
+                    with open(report_path, 'r', encoding='utf-8') as f:
+                        report_data = json.load(f)
+                    
+                    # 检查 collectors 中的错误
+                    if 'collectors' in report_data:
+                        collection_errors = []
+                        for collector in report_data['collectors']:
+                            if 'longrepr' in collector and collector['longrepr']:
+                                collection_errors.append({
+                                    'nodeid': collector.get('nodeid', 'unknown'),
+                                    'error': collector['longrepr'][:500]  # 限制长度
+                                })
+                        
+                        if collection_errors:
+                            printf(f"[run_pytest] JSON报告中发现 {len(collection_errors)} 个收集错误:")
+                            for i, err in enumerate(collection_errors[:5], 1):
+                                printf(f"  错误 {i}: {err['nodeid']}")
+                                printf(f"    {err['error'][:200]}...")
+                            if len(collection_errors) > 5:
+                                printf(f"  ... 和其他 {len(collection_errors) - 5} 个错误")
+                    
+                    # 检查 summary 中的错误统计
+                    if 'summary' in report_data:
+                        summary = report_data['summary']
+                        printf(f"[run_pytest] 测试摘要: {summary}")
+                else:
+                    printf(f"[run_pytest] JSON报告不存在或路径未找到")
+            except Exception as e:
+                printf(f"[run_pytest] ⚠️  解析 JSON 报告失败: {e}")
+            
+            # === 新增：保存完整输出到诊断文件 ===
+            try:
+                # 获取输出目录
+                output_dir = None
+                for i, arg in enumerate(pytest_args):
+                    if arg.startswith('--json-report-file='):
+                        output_dir = os.path.dirname(arg.split('=')[1])
+                        break
+                    elif arg == '--json-report-file' and i + 1 < len(pytest_args):
+                        output_dir = os.path.dirname(pytest_args[i + 1])
+                        break
+                
+                if output_dir:
+                    diagnostic_file = os.path.join(output_dir, "pytest_collection_diagnostic.log")
+                    with open(diagnostic_file, 'w', encoding='utf-8') as f:
+                        f.write("=" * 80 + "\n")
+                        f.write("PYTEST COLLECTION DIAGNOSTIC LOG\n")
+                        f.write("=" * 80 + "\n\n")
+                        f.write(f"Return Code: {result.returncode}\n")
+                        f.write(f"Working Directory: {cwd}\n")
+                        f.write(f"Command: {sys.executable} -m pytest {' '.join(pytest_args[:5])}...\n\n")
+                        f.write("=" * 80 + "\n")
+                        f.write("COMPLETE STDOUT:\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(stdout_text)
+                        f.write("\n\n" + "=" * 80 + "\n")
+                        f.write("COMPLETE STDERR:\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(stderr_text)
+                        f.write("\n\n" + "=" * 80 + "\n")
+                        f.write("END OF DIAGNOSTIC LOG\n")
+                        f.write("=" * 80 + "\n")
+                    printf(f"[run_pytest] ✅ 完整诊断日志已保存: {diagnostic_file}")
+            except Exception as e:
+                printf(f"[run_pytest] ⚠️  保存诊断日志失败: {e}")
             
             # 提取成功收集的测试数量
             match = re.search(r'(\d+) tests? collected', stdout_text)
@@ -485,6 +590,7 @@ def run_pytest(cwd: str, pytest_args: List[str]) -> None:
                 printf(f"✅ Successfully collected {collected_count} tests despite collection errors")
             else:
                 printf(f"[run_pytest] ⚠️  无法从输出中提取收集的测试数量")
+                printf(f"[run_pytest] 这可能表示测试收集完全失败")
             
             printf(f"ℹ️  Continuing with successfully collected tests...")
             printf("─" * 60)
@@ -532,8 +638,8 @@ def collect_tests(
         "--json-report",
         "--json-report-indent=4",
         f"--json-report-file={_output_dir}/{report_file}",
-        "--tb=no",
-        "-q"
+        "--tb=short",  # 改为显示简短的traceback（原来是 --tb=no）
+        "-v"           # 改为详细模式（原来是 -q）
     ]
 
     # 添加忽略参数
