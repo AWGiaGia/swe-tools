@@ -915,20 +915,10 @@ def trace_test(test: str, cwd: str, temp_dir: str) -> None:
         with TemporaryDirectory(dir=temp_dir) as _temp_dir:
             printf(f"[trace_test] 临时目录: {_temp_dir}")
 
-            # pytest_args = [
-            #     "--cache-clear",
-            #     f"--rootdir={cwd}",
-            #     "-o",
-            #     f"cache_dir={_temp_dir}/.pytest_cache",
-            #     "--no-cov",
-            #     "--json-report",
-            #     "--json-report-indent=4",
-            #     f"--json-report-file={_temp_dir}/report.json",
-            #     "--tb=short",  # 修改：显示简短的traceback（从 --tb=no 改为 --tb=short）
-            #     "-v",          # 修改：详细模式（从 -q 改为 -v）
-            #     "-s",          # 新增：显示print输出
-            #     test,
-            # ]
+            # ========== 修复：确保 .pytest_cache 目录存在 ==========
+            pytest_cache_dir = os.path.join(_temp_dir, ".pytest_cache")
+            os.makedirs(pytest_cache_dir, exist_ok=True)
+            # =====================================================
 
             pytest_args = [
                 "--cache-clear",
