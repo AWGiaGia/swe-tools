@@ -29,6 +29,25 @@ pytest_ignore_list = [
 ]
 
 
+# Astropy 自研的 pytest 插件列表（Home-page 为 astropy.org）
+# 这些插件可能与新版 pytest 不兼容，需要在出错时禁用
+ASTROPY_PYTEST_PLUGINS = [
+    "arraydiff",
+    "astropy",
+    "astropy_header",
+    "doctestplus",
+    "filter_subpackage",
+    "openfiles",
+    "remotedata",
+]
+
+def get_astropy_plugin_disable_args() -> list:
+    """生成禁用所有 astropy 自研 pytest 插件的参数列表"""
+    args = []
+    for plugin in ASTROPY_PYTEST_PLUGINS:
+        args.extend(["-p", f"no:{plugin}"])
+    return args
+
 
 def detect_django_settings(project_root: str) -> Optional[str]:
     """
@@ -669,17 +688,31 @@ def collect_tests(
     printf(f"[collect_tests] 第一次尝试：使用标准配置收集测试")
     error_info = run_pytest(cwd=cwd, pytest_args=pytest_args, raise_on_error=False)
     
-    # 检查是否因为 pytest-doctestplus 失败
-    if error_info and "pytest_doctestplus" in error_info.lower():
-        printf(f"\n[collect_tests] ⚠️  检测到 pytest-doctestplus 插件导致收集失败")
-        printf(f"[collect_tests] 尝试禁用 pytest-doctestplus 插件后重试...")
+    # 检查是否因为 astropy 自研 pytest 插件导致失败
+    # 检测关键词：插件名称、常见错误模式（get_marker、from_parent 等）
+    astropy_plugin_patterns = [
+        "pytest_doctestplus", "pytest_remotedata", "pytest_openfiles",
+        "pytest_arraydiff", "pytest_astropy", "pytest_filter_subpackage",
+        "get_marker",  # pytest 6+ 移除的 API
+        "from_parent",  # pytest 新版要求的构造方式
+        "DirectConstruction",  # 直接构造已弃用的错误
+    ]
+    
+    is_astropy_plugin_error = error_info and any(
+        pattern.lower() in error_info.lower() for pattern in astropy_plugin_patterns
+    )
+    
+    if is_astropy_plugin_error:
+        printf(f"\n[collect_tests] ⚠️  检测到 astropy 自研 pytest 插件导致收集失败")
+        printf(f"[collect_tests] 将禁用所有 astropy 自研插件后重试...")
+        printf(f"[collect_tests] 禁用的插件: {', '.join(ASTROPY_PYTEST_PLUGINS)}")
         
-        # 添加禁用插件的参数
+        # 添加禁用所有 astropy 插件的参数
         retry_args = pytest_args.copy()
-        retry_args.extend(["-p", "no:doctestplus"])
+        retry_args.extend(get_astropy_plugin_disable_args())
         
         # 第二次尝试
-        printf(f"[collect_tests] 第二次尝试：禁用 doctestplus 插件")
+        printf(f"[collect_tests] 第二次尝试：禁用所有 astropy 自研插件")
         error_info_retry = run_pytest(cwd=cwd, pytest_args=retry_args, raise_on_error=False)
         
         if error_info_retry:
@@ -687,12 +720,13 @@ def collect_tests(
             printf(f"[collect_tests] ❌ 禁用插件后仍然失败")
             printf(f"[collect_tests] 将尝试使用已收集的测试继续...")
         else:
-            printf(f"[collect_tests] ✅ 禁用插件后收集成功！")
+            printf(f"[collect_tests] ✅ 禁用 astropy 插件后收集成功！")
             # 创建标记文件记录使用了降级方案
             try:
-                marker_file = Path(_output_dir) / "doctestplus_disabled.marker"
+                marker_file = Path(_output_dir) / "astropy_plugins_disabled.marker"
                 with open(marker_file, 'w') as f:
-                    f.write("pytest-doctestplus plugin was disabled due to compatibility issues\n")
+                    f.write("Astropy pytest plugins were disabled due to compatibility issues\n")
+                    f.write(f"Disabled plugins: {', '.join(ASTROPY_PYTEST_PLUGINS)}\n")
                 printf(f"[collect_tests] 已创建标记文件: {marker_file}")
             except Exception as e:
                 printf(f"[collect_tests] ⚠️  创建标记文件失败: {e}")
@@ -941,10 +975,17 @@ def trace_test(test: str, cwd: str, temp_dir: str) -> None:
             for ignore_dir in pytest_ignore_list:
                 pytest_args.append(f"--ignore={ignore_dir}")
 
-            # 检查是否需要禁用 doctestplus 插件（与 collect_tests 保持一致）
-            marker_file = Path("/workspace/result/doctestplus_disabled.marker")
-            if marker_file.exists():
-                printf(f"[trace_test] 检测到 doctestplus 已在收集阶段被禁用，继续禁用")
+        # 检查是否需要禁用 astropy 自研插件（与 collect_tests 保持一致）
+            # 优先检查新的标记文件，兼容旧的标记文件
+            astropy_marker = Path("/workspace/result/astropy_plugins_disabled.marker")
+            legacy_marker = Path("/workspace/result/doctestplus_disabled.marker")
+            
+            if astropy_marker.exists():
+                printf(f"[trace_test] 检测到 astropy 插件已在收集阶段被禁用，继续禁用所有 astropy 插件")
+                pytest_args.extend(get_astropy_plugin_disable_args())
+            elif legacy_marker.exists():
+                # 兼容旧的标记文件
+                printf(f"[trace_test] 检测到 doctestplus 已在收集阶段被禁用（旧标记），继续禁用")
                 pytest_args.extend(["-p", "no:doctestplus"])
 
             printf(f"[trace_test] pytest参数数量: {len(pytest_args)}")
