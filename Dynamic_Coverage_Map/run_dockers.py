@@ -253,6 +253,19 @@ class DockerBatchRunner:
             return '_'.join(parts[-2:])  # 取最后两部分
         return parts[-1]
     
+    def _needs_httpbin(self, instance_id: str) -> bool:
+            """
+            检测是否需要本地 httpbin 服务
+            
+            Args:
+                instance_id: 实例标识符
+                
+            Returns:
+                如果需要 httpbin 返回 True
+            """
+            httpbin_patterns = ['requests', 'urllib3', 'httpx', 'aiohttp']
+            return any(p in instance_id.lower() for p in httpbin_patterns)
+
     def run_in_container(self, image_info: Dict) -> bool:
         """
         在指定镜像的容器中执行脚本
@@ -311,6 +324,12 @@ class DockerBatchRunner:
             log.info(f"创建容器: {container_name}")
             log.debug(f"挂载卷: {volumes}")
             
+            # 检测是否需要 httpbin
+            needs_httpbin = self._needs_httpbin(instance_id)
+            extra_hosts = {'httpbin.org': '127.0.0.1'} if needs_httpbin else None
+            if needs_httpbin:
+                log.info(f"🌐 检测到需要 httpbin 服务，将启用本地 httpbin")
+            
             # 创建并启动容器
             container = self.client.containers.run(
                 image_tag,
@@ -321,7 +340,8 @@ class DockerBatchRunner:
                 tty=True,
                 volumes=volumes,
                 pid_mode='host',
-                remove=False  # 不自动删除，便于调试
+                remove=False,  # 不自动删除，便于调试
+                extra_hosts=extra_hosts
             )
             
             log.info(f"✓ 容器已创建: {container.short_id}")
@@ -338,17 +358,30 @@ class DockerBatchRunner:
             #     "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
             # ]
             
-            # 为了修补pytest仓库上的运行问题，而进行的兼容修改
-            commands = [
-                # 步骤1：检测是否存在pytest源码
-                r"test -f /testbed/src/_pytest/__init__.py && echo 'has_pytest_src' > /tmp/pytest_check.txt || echo 'no_pytest_src' > /tmp/pytest_check.txt",
-                
-                # 步骤2：根据检测结果安装依赖
-                r"""conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; CHECK=$(cat /tmp/pytest_check.txt); if [ "$CHECK" = "has_pytest_src" ]; then echo 检测到testbed中有pytest源码,安装兼容旧版本的插件; pip install pytest-json-report==1.5.0 pytest-metadata==2.0.4 pytest-cov==2.12.1; else echo 未检测到pytest源码,使用默认安装; pip install pytest-json-report pytest-cov; fi'""",
-                
-                # 步骤3：运行脚本
+            # 构建命令序列
+            commands = []
+            
+            # 步骤0（可选）：如果需要 httpbin，安装并启动本地服务
+            if needs_httpbin:
+                commands.append(
+                    r"""conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; pip install httpbin gunicorn -q && gunicorn httpbin:app -b 0.0.0.0:80 -D && echo httpbin_started || echo httpbin_failed_but_continuing'"""
+                )
+
+
+            # 步骤1：检测是否存在pytest源码
+            commands.append(
+                r"test -f /testbed/src/_pytest/__init__.py && echo 'has_pytest_src' > /tmp/pytest_check.txt || echo 'no_pytest_src' > /tmp/pytest_check.txt"
+            )
+            
+            # 步骤2：根据检测结果安装依赖
+            commands.append(
+                r"""conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; CHECK=$(cat /tmp/pytest_check.txt); if [ "$CHECK" = "has_pytest_src" ]; then echo 检测到testbed中有pytest源码,安装兼容旧版本的插件; pip install pytest-json-report==1.5.0 pytest-metadata==2.0.4 pytest-cov==2.12.1; else echo 未检测到pytest源码,使用默认安装; pip install pytest-json-report pytest-cov; fi'"""
+            )
+            
+            # 步骤3：运行脚本
+            commands.append(
                 "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
-            ]
+            )
 
             for i, cmd in enumerate(commands, 1):
                 log.info(f"执行命令 {i}/{len(commands)}: {cmd[:80]}...")

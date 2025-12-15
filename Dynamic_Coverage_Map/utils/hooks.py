@@ -121,6 +121,15 @@ def main():
 
     known_args, unknown_args = parser.parse_known_args()
 
+    # Django 项目初始化：确保在运行测试前完成 AppRegistry 初始化
+    if os.environ.get('DJANGO_SETTINGS_MODULE'):
+        try:
+            import django
+            django.setup()
+        except Exception as e:
+            # 初始化失败不阻断流程，记录警告后继续
+            print(f"[hooks] Warning: Django setup failed: {e}", file=sys.stderr)
+
     tracer = CallTracer(base_dir=known_args.base_dir)
     tracer.start()
 
