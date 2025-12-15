@@ -13,11 +13,6 @@ import warnings
 warnings.filterwarnings('ignore', category=SyntaxWarning)
 
 
-CATEGORY_BY_REPO_NAME = {
-    "scikit-learn": "/home/jiawei/CommitInsight/repos/scikit-learn"
-}
-
-
 def get_class_at_line(file_path, line_number):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -41,39 +36,31 @@ def get_class_at_line(file_path, line_number):
 
 
 def process_single_folder(args):
-    """处理单个文件夹的函数，使用临时工作目录"""
-    raw_result_folder, raw_results_root_folder, target_results_root_folder, base_commit_map = args
+    """处理单个文件夹的函数，动态克隆仓库到临时目录"""
+    raw_result_folder, raw_results_root_folder, target_results_root_folder, instance_info_map = args
     
     temp_dir = None
     try:
-        # 移除这个 print，减少输出干扰
-        # print(f"Processing folder: {raw_result_folder}")
-        
         raw_reult_path = os.path.join(raw_results_root_folder, raw_result_folder, "result", "traces.json")
 
-        # 找到对应的repo
-        repo_path = None
-        for repo_name in CATEGORY_BY_REPO_NAME:
-            if repo_name in raw_result_folder:
-                repo_path = CATEGORY_BY_REPO_NAME[repo_name]
-                break
-        
-        if repo_path is None:
-            return f"Error: No matching repo for {raw_result_folder}"
-        
+        # 从文件夹名称解析 instance_name
         instance_name = raw_result_folder.split("_")[-1]
         instance_name = instance_name.rsplit("-", 1)[0] + "__" + instance_name
 
-        base_commit = base_commit_map.get(instance_name)
-        if base_commit is None:
-            return f"Error: No base commit found for {instance_name}"
+        instance_info = instance_info_map.get(instance_name)
+        if instance_info is None:
+            return f"Error: No instance info found for {instance_name}"
 
-        # 创建临时工作目录（使用 git worktree）
-        temp_dir = tempfile.mkdtemp(prefix=f"worktree_{raw_result_folder}_")
-        repo = git.Repo(repo_path)
-        
-        # 使用 git worktree 创建独立的工作目录
-        repo.git.worktree('add', temp_dir, base_commit, '--detach')
+        base_commit = instance_info['base_commit']
+        repo = instance_info['repo']
+
+        # 构建 GitHub URL 并克隆到临时目录
+        repo_url = f"https://github.com/{repo}.git"
+        temp_dir = tempfile.mkdtemp(prefix=f"repo_{raw_result_folder}_")
+
+        # 克隆仓库并切换到指定 commit
+        cloned_repo = git.Repo.clone_from(repo_url, temp_dir)
+        cloned_repo.git.checkout(base_commit)
         
         # 读取 traces.json
         with open(raw_reult_path, "r") as f:
@@ -110,16 +97,12 @@ def process_single_folder(args):
         return f"✗ {raw_result_folder}: {str(e)}"
     
     finally:
-        # 清理临时工作目录
+        # 清理临时目录
         if temp_dir and os.path.exists(temp_dir):
-            try:
-                repo = git.Repo(repo_path)
-                repo.git.worktree('remove', temp_dir, '--force')
-            except:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def process_raw_results(raw_results_root_folder, target_results_root_folder, base_commit_map, num_processes=4):
+def process_raw_results(raw_results_root_folder, target_results_root_folder, instance_info_map, num_processes=4):
     folders = [f for f in os.listdir(raw_results_root_folder) 
                if os.path.isdir(os.path.join(raw_results_root_folder, f))]
     
@@ -128,7 +111,7 @@ def process_raw_results(raw_results_root_folder, target_results_root_folder, bas
     
     # 准备参数
     args_list = [
-        (folder, raw_results_root_folder, target_results_root_folder, base_commit_map)
+        (folder, raw_results_root_folder, target_results_root_folder, instance_info_map)
         for folder in folders
     ]
     
@@ -163,16 +146,19 @@ def process_raw_results(raw_results_root_folder, target_results_root_folder, bas
 
 
 if __name__ == '__main__':
-    base_commit_map = dict()
+    # 构建 instance 信息映射，包含 base_commit 和 repo
+    instance_info_map = dict()
     swe_bench_data = load_dataset("/home/jiawei/RepoCodeLoc/swe-bench-lite")
     for item in swe_bench_data['test']:
         instance = item['instance_id']
-        base_commit = item['base_commit']
-        base_commit_map[instance] = base_commit
+        instance_info_map[instance] = {
+            'base_commit': item['base_commit'],
+            'repo': item['repo']  # 格式如 "scikit-learn/scikit-learn"
+        }
 
-    raw_results_root_folder = "/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results copy"
-    target_results_root_folder = "/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results_scikit-learn_repaired"
+    raw_results_root_folder = "/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results"
+    target_results_root_folder = "/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results_repaired"
     
     # 设置进程数
     num_processes = min(os.cpu_count(), 23)
-    process_raw_results(raw_results_root_folder, target_results_root_folder, base_commit_map, num_processes=num_processes)
+    process_raw_results(raw_results_root_folder, target_results_root_folder, instance_info_map, num_processes=num_processes)
