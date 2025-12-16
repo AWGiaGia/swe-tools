@@ -44,6 +44,21 @@ class CallTracer:
 
         return True
 
+    def _get_class_name(self, frame: FrameType) -> Optional[str]:
+        """
+        尝试从 frame 中提取类名（实例方法的 self 或类方法的 cls）
+        """
+        try:
+            if 'self' in frame.f_locals:
+                return frame.f_locals['self'].__class__.__name__
+            if 'cls' in frame.f_locals:
+                cls = frame.f_locals['cls']
+                if isinstance(cls, type):
+                    return cls.__name__
+        except Exception:
+            pass
+        return None
+
     def trace_calls(self, frame: FrameType, event: str, arg: Any):
         """
         Trace the calls of the program.
@@ -58,9 +73,16 @@ class CallTracer:
                 return self.trace_calls
 
             if self.call_stack:
-                caller_file, caller_func, caller_line = self.call_stack[-1]
+                caller_file, caller_func, caller_line, caller_class = self.call_stack[-1]
             else:
-                caller_file, caller_func, caller_line = (None, None, None)
+                caller_file, caller_func, caller_line, caller_class = (None, None, None, None)
+
+            # 获取当前被调用函数的类名
+            callee_class = self._get_class_name(frame)
+
+            # push the current call to the call stack (包含 class_name)
+            self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno, callee_class))
+
 
             # push the current call to the call stack
             self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno))
@@ -69,12 +91,14 @@ class CallTracer:
                 "caller": {
                     "filepath": caller_file,
                     "lineno": caller_line,
-                    "func_name": caller_func
+                    "func_name": caller_func,
+                    "class_name": caller_class if caller_class else ""
                 },
                 "callee": {
                     "filepath": str(Path(file_name).relative_to(self.base_dir)),
                     "lineno": lineno,
-                    "func_name": func_name
+                    "func_name": func_name,
+                    "class_name": callee_class if callee_class else ""
                 },
             }
             record_key = json.dumps(new_record, sort_keys=True)
@@ -91,7 +115,7 @@ class CallTracer:
 
         elif event == "return":
             if self.call_stack:
-                top_file, top_func, top_line = self.call_stack[-1]
+                top_file, top_func, top_line, _top_class = self.call_stack[-1]
                 if self._in_base_dir(top_file) and self._is_function(top_func) and top_func == func_name:
                     # pop the current call from the call stack
                     self.call_stack.pop()
