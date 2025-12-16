@@ -80,12 +80,8 @@ class CallTracer:
             # 获取当前被调用函数的类名
             callee_class = self._get_class_name(frame)
 
-            # push the current call to the call stack (包含 class_name)
+            # push the current call to th call stack (包含 class_name)
             self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno, callee_class))
-
-
-            # push the current call to the call stack
-            self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno))
 
             new_record = {
                 "caller": {
