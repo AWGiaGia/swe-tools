@@ -10,6 +10,9 @@ import shutil
 import warnings
 import logging
 from datetime import datetime
+import gc
+from collections import OrderedDict
+
 
 try:
     import orjson
@@ -20,6 +23,40 @@ except ImportError:
 
 # 忽略 SyntaxWarning
 warnings.filterwarnings('ignore', category=SyntaxWarning)
+
+
+GLOBAL_RAW_ROOT = None
+GLOBAL_TARGET_ROOT = None
+GLOBAL_INSTANCE_INFO = None
+GLOBAL_ISSUE_MAP = None
+
+def init_worker(raw_root, target_root, instance_info, issue_map):
+    """多进程初始化函数"""
+    global GLOBAL_RAW_ROOT, GLOBAL_TARGET_ROOT, GLOBAL_INSTANCE_INFO, GLOBAL_ISSUE_MAP
+    GLOBAL_RAW_ROOT = raw_root
+    GLOBAL_TARGET_ROOT = target_root
+    GLOBAL_INSTANCE_INFO = instance_info
+    GLOBAL_ISSUE_MAP = issue_map
+
+
+class ASTLRUCache:
+    """带有容量限制的 AST 缓存，防止内存无限增长"""
+    def __init__(self, capacity=50):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    def put(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
 
 
 # 日志目录
@@ -111,34 +148,53 @@ def get_class_at_line(file_path, line_number):
 
 
 def get_class_at_line_with_cache(file_path, line_number, ast_cache):
-    """带缓存的类查找函数，避免同一文件重复解析 AST"""
-    if file_path not in ast_cache:
+    """带 LRU 缓存的类查找函数"""
+    # 修改 1: 使用 ast_cache.get() 获取缓存
+    tree = ast_cache.get(file_path)
+    
+    # 如果缓存未命中，则解析文件
+    if tree is None:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 source = f.read()
-            ast_cache[file_path] = ast.parse(source)
+            tree = ast.parse(source)
+            # 修改 2: 解析成功，放入缓存
+            ast_cache.put(file_path, tree)
         except Exception:
-            ast_cache[file_path] = None
+            # 解析失败存为 False，避免重复读取同一错误文件
+            ast_cache.put(file_path, False)
+            tree = False
     
-    tree = ast_cache[file_path]
-    if tree is None:
+    # 如果之前标记为解析失败，直接返回 None
+    if tree is False:
         return None
     
+    # 遍历 AST 查找类名 (逻辑保持不变)
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             class_start = node.lineno
+            # 计算类的结束行号
             class_end = max(
                 getattr(child, 'end_lineno', 0) 
                 for child in ast.walk(node)
             )
+            # 兼容处理：如果类内部没有子节点或获取不到行号，至少覆盖起始行
+            if class_end == 0: 
+                class_end = class_start
+
             if class_start <= line_number <= class_end:
                 return node.name
     return None
 
 
-def process_single_folder(args):
+def process_single_folder(raw_result_folder):
     """处理单个文件夹的函数，动态克隆仓库到临时目录"""
-    raw_result_folder, raw_results_root_folder, target_results_root_folder, instance_info_map, issue_to_instance = args
+    # [修改] 从全局变量获取配置，替代参数解包
+    # 请确保在文件头部定义了这些 GLOBAL_ 变量并在 init_worker 中赋值
+    raw_results_root_folder = GLOBAL_RAW_ROOT
+    target_results_root_folder = GLOBAL_TARGET_ROOT
+    instance_info_map = GLOBAL_INSTANCE_INFO
+    issue_to_instance = GLOBAL_ISSUE_MAP
     
     # 初始化实例日志
     logger = setup_instance_logger(raw_result_folder)
@@ -163,12 +219,14 @@ def process_single_folder(args):
     start_time = datetime.now()
     
     try:
-        ast_cache = {}  # 缓存已解析的 AST，避免重复解析同一文件
+        # [修改] 使用 LRU Cache 替代普通字典，容量设为 50
+        # 这样即使文件很多，内存占用也是有上限的
+        ast_cache = ASTLRUCache(capacity=50) 
+        
         raw_reult_path = os.path.join(raw_results_root_folder, raw_result_folder, "result", "traces.json")
         logger.debug(f"traces.json 路径: {raw_reult_path}")
 
         # 从文件夹名称解析 instance_name
-        # 提取 issue 部分，如 "_pylint-7993" → "pylint-7993"
         issue_part = raw_result_folder.split("_")[-1]
         logger.debug(f"提取的 issue 部分: {issue_part}")
         
@@ -194,7 +252,7 @@ def process_single_folder(args):
         temp_dir = tempfile.mkdtemp(prefix=f"repo_{raw_result_folder}_")
         logger.debug(f"临时目录: {temp_dir}")
 
-        # 使用 shallow fetch 只获取特定 commit，大幅减少下载量
+        # 使用 shallow fetch 只获取特定 commit
         logger.info("开始 shallow fetch...")
         fetch_start = datetime.now()
         git.Repo.init(temp_dir)
@@ -209,7 +267,7 @@ def process_single_folder(args):
         logger.info("读取 traces.json...")
         read_start = datetime.now()
         if USE_ORJSON:
-            with open(raw_reult_path, "rb") as f:  # orjson 需要二进制模式
+            with open(raw_reult_path, "rb") as f:
                 raw_results = orjson.loads(f.read())
         else:
             with open(raw_reult_path, "r") as f:
@@ -227,6 +285,7 @@ def process_single_folder(args):
         
         for item_idx, item in enumerate(raw_results):
             relations = item.get("call-relations", [])
+            # 减少日志量，只在 debug 模式记录
             if relations:
                 logger.debug(f"处理 item[{item_idx}]: {len(relations)} 个 relations")
             
@@ -237,7 +296,7 @@ def process_single_folder(args):
                 caller_filepath = os.path.join(temp_dir, caller["filepath"])
                 callee_filepath = os.path.join(temp_dir, callee["filepath"])
                 
-                # 使用临时目录中的文件
+                # 使用带缓存的函数 (ast_cache 现在是 ASTLRUCache 对象)
                 caller_class = get_class_at_line_with_cache(
                     caller_filepath, 
                     caller["lineno"],
@@ -258,7 +317,7 @@ def process_single_folder(args):
         
         logger.info(f"处理完成: {processed_relations} 个 relations")
         logger.info(f"解析了 {len(files_parsed)} 个不同的文件")
-        logger.info(f"AST 缓存命中情况: 缓存了 {len(ast_cache)} 个文件的 AST")
+        # logger.info(f"AST 缓存命中情况: {len(ast_cache.cache)}") # 可选打印缓存大小
 
         # 保存修复后的结果
         output_dir = os.path.join(target_results_root_folder, raw_result_folder, "result")
@@ -267,7 +326,7 @@ def process_single_folder(args):
         logger.info(f"保存结果到: {save_path}")
         
         if USE_ORJSON:
-            with open(save_path, "wb") as f:  # orjson 需要二进制模式
+            with open(save_path, "wb") as f:
                 f.write(orjson.dumps(raw_results, option=orjson.OPT_INDENT_2))
         else:
             with open(save_path, "w") as f:
@@ -278,6 +337,10 @@ def process_single_folder(args):
         logger.info(f"处理成功! 总耗时: {total_time:.2f}s")
         logger.info(f"{'='*60}")
         
+        # [新增] 显式释放大对象内存，帮助 GC
+        del raw_results
+        del ast_cache
+
         return f"✓ {raw_result_folder}"
     
     except Exception as e:
@@ -299,10 +362,13 @@ def process_single_folder(args):
             logger.debug(f"清理临时目录: {temp_dir}")
             shutil.rmtree(temp_dir, ignore_errors=True)
         
-        # 关闭 logger 的 handlers，释放文件句柄
+        # 关闭 logger 的 handlers
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
+        
+        # [新增] 显式垃圾回收，确保进程常驻时内存能回落
+        gc.collect()
 
 def process_raw_results(raw_results_root_folder, target_results_root_folder, instance_info_map, issue_to_instance, num_processes=4):
     main_logger = setup_main_logger()
@@ -322,14 +388,14 @@ def process_raw_results(raw_results_root_folder, target_results_root_folder, ins
     print(f"Found {len(folders)} folders to process")
     print(f"Using {num_processes} processes")
     
-    # 准备参数
-    args_list = [
-        (folder, raw_results_root_folder, target_results_root_folder, instance_info_map, issue_to_instance)
-        for folder in folders
-    ]
+    # [修改] args_list 现在只包含文件夹名称，不再传递整个 map
+    args_list = folders
     
-    # 使用进程池处理
-    with Pool(processes=num_processes) as pool:
+    # [修改] 使用 initializer 初始化进程池，设置全局变量
+    with Pool(processes=num_processes, 
+              initializer=init_worker, 
+              initargs=(raw_results_root_folder, target_results_root_folder, instance_info_map, issue_to_instance)) as pool:
+        
         # 使用 imap_unordered 以获得更好的进度显示
         results = list(tqdm(
             pool.imap_unordered(process_single_folder, args_list),
@@ -387,7 +453,6 @@ def process_raw_results(raw_results_root_folder, target_results_root_folder, ins
         for result in results:
             if result.startswith("⊘"):
                 main_logger.info(f"  {result}")
-
 
 if __name__ == '__main__':
     # 构建 instance 信息映射，包含 base_commit 和 repo

@@ -38,7 +38,8 @@ class DockerBatchRunner:
         result_base_dir: str,
         image_prefix: str = "swebench/sweb.eval.x86_64.scikit-learn_1776",
         log_dir: str = "./logs",
-        parallel: int = 1  # 新增参数
+        parallel: int = 1,
+        docker_timeout: Optional[int] = None  # 新增：容器超时时间（秒）
     ):
         """
         初始化批量执行器
@@ -57,6 +58,9 @@ class DockerBatchRunner:
         self.log_dir = os.path.abspath(log_dir)
         self.last_run_skipped = False
         self.parallel = parallel  # 新增：保存并行度
+        self.docker_timeout = docker_timeout  # 新增：容器超时时间
+
+        # 创建日志目录
 
         # 创建日志目录
         os.makedirs(self.log_dir, exist_ok=True)
@@ -378,21 +382,66 @@ class DockerBatchRunner:
                 r"""conda run -n testbed bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; CHECK=$(cat /tmp/pytest_check.txt); if [ "$CHECK" = "has_pytest_src" ]; then echo 检测到testbed中有pytest源码,安装兼容旧版本的插件; pip install pytest-json-report==1.5.0 pytest-metadata==2.0.4 pytest-cov==2.12.1; else echo 未检测到pytest源码,使用默认安装; pip install pytest-json-report pytest-cov; fi'"""
             )
             
-            # 步骤3：运行脚本
+            # 步骤3：运行脚本（使用 tee 同时输出到日志文件）
             commands.append(
-                "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result'"
+                "conda run -n testbed bash -c 'cd /host_scripts && python trace.py --project-root /testbed --max-workers 16 --output-dir /workspace/result 2>&1 | tee /workspace/result/trace_runtime.log'"
             )
 
+            # 计算超时时间
+            container_start_time = time.time()
+            
             for i, cmd in enumerate(commands, 1):
+                # 检查是否已超时
+                if self.docker_timeout:
+                    elapsed = time.time() - container_start_time
+                    if elapsed >= self.docker_timeout:
+                        log.error(f"⏰ 容器执行超时 ({elapsed:.0f}秒 >= {self.docker_timeout}秒)")
+                        return False
+                    remaining_timeout = self.docker_timeout - elapsed
+                    log.debug(f"剩余超时时间: {remaining_timeout:.0f}秒")
+                
                 log.info(f"执行命令 {i}/{len(commands)}: {cmd[:80]}...")
                 
                 try:
-                    exit_code, output = container.exec_run(
-                        f'/bin/bash -c "{cmd}"',
-                        stdout=True,
-                        stderr=True,
-                        demux=True
-                    )
+                    # 使用线程实现超时控制
+                    import threading
+                    
+                    exec_result = {'exit_code': None, 'output': None, 'error': None}
+                    
+                    def run_exec():
+                        try:
+                            exit_code, output = container.exec_run(
+                                f'/bin/bash -c "{cmd}"',
+                                stdout=True,
+                                stderr=True,
+                                demux=True
+                            )
+                            exec_result['exit_code'] = exit_code
+                            exec_result['output'] = output
+                        except Exception as e:
+                            exec_result['error'] = e
+                    
+                    exec_thread = threading.Thread(target=run_exec)
+                    exec_thread.start()
+                    
+                    # 计算此命令的超时时间
+                    if self.docker_timeout:
+                        elapsed = time.time() - container_start_time
+                        cmd_timeout = max(60, self.docker_timeout - elapsed)  # 至少 60 秒
+                    else:
+                        cmd_timeout = None
+                    
+                    exec_thread.join(timeout=cmd_timeout)
+                    
+                    if exec_thread.is_alive():
+                        log.error(f"⏰ 命令执行超时，强制终止容器")
+                        return False
+                    
+                    if exec_result['error']:
+                        raise exec_result['error']
+                    
+                    exit_code = exec_result['exit_code']
+                    output = exec_result['output']
                     
                     # 解析输出
                     stdout_output = output[0].decode('utf-8') if output[0] else ""
@@ -627,8 +676,25 @@ def main():
         default=8,
         help='并行处理的容器数量（默认: 1，建议: 4-8）'
     )
+    
+    parser.add_argument(
+        '--docker-timeout',
+        type=int,
+        default=None,
+        help='单个容器最大执行时间（秒）。启用时默认 25200 秒（7小时）。不指定则不限时。'
+    )
+    
+    parser.add_argument(
+        '--enable-timeout',
+        action='store_true',
+        help='启用容器超时限制（默认 7 小时）'
+    )
 
     args = parser.parse_args()
+    
+    # 处理 timeout 参数
+    if args.enable_timeout and args.docker_timeout is None:
+        args.docker_timeout = 25200  # 7 小时
     
     # 验证目录存在
     if not os.path.exists(args.script_dir):
@@ -641,7 +707,8 @@ def main():
         result_base_dir=args.result_dir,
         image_prefix=args.image_prefix,
         log_dir=args.log_dir,
-        parallel=args.parallel  # 新增参数
+        parallel=args.parallel,
+        docker_timeout=args.docker_timeout  # 新增参数
     )
     
     runner.run_batch(max_containers=args.max)

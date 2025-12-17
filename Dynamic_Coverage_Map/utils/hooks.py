@@ -83,21 +83,18 @@ class CallTracer:
             # push the current call to th call stack (包含 class_name)
             self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno, callee_class))
 
-            new_record = {
-                "caller": {
-                    "filepath": caller_file,
-                    "lineno": caller_line,
-                    "func_name": caller_func,
-                    "class_name": caller_class if caller_class else ""
-                },
-                "callee": {
-                    "filepath": str(Path(file_name).relative_to(self.base_dir)),
-                    "lineno": lineno,
-                    "func_name": func_name,
-                    "class_name": callee_class if callee_class else ""
-                },
-            }
-            record_key = json.dumps(new_record, sort_keys=True)
+
+            # 先计算一次callee_filepath，避免重复计算
+            callee_filepath = str(Path(file_name).relative_to(self.base_dir))
+            caller_cls = caller_class or ""
+            callee_cls = callee_class or ""
+
+            # 用 tuple 去重（快）
+            record_key = (
+                caller_file, caller_line, caller_func, caller_cls,
+                callee_filepath, lineno, func_name, callee_cls
+            )
+
             # skip if the record is already in the set
             if record_key in self.call_records_set:
                 return self.trace_calls
@@ -106,6 +103,22 @@ class CallTracer:
             if any(v is None for v in [caller_file, caller_func, caller_line, file_name, func_name, lineno]):
                 return self.trace_calls
 
+            # 后续代码中复用已计算的值
+            new_record = {
+                "caller": {
+                    "filepath": caller_file,
+                    "lineno": caller_line,
+                    "func_name": caller_func,
+                    "class_name": caller_cls
+                },
+                "callee": {
+                    "filepath": callee_filepath,  
+                    "lineno": lineno,
+                    "func_name": func_name,
+                    "class_name": callee_cls
+                },
+            }
+            
             self.call_records_set.add(record_key)
             self.call_records.append(new_record)
 
