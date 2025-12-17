@@ -44,6 +44,21 @@ class CallTracer:
 
         return True
 
+    def _get_class_name(self, frame: FrameType) -> Optional[str]:
+        """
+        尝试从 frame 中提取类名（实例方法的 self 或类方法的 cls）
+        """
+        try:
+            if 'self' in frame.f_locals:
+                return frame.f_locals['self'].__class__.__name__
+            if 'cls' in frame.f_locals:
+                cls = frame.f_locals['cls']
+                if isinstance(cls, type):
+                    return cls.__name__
+        except Exception:
+            pass
+        return None
+
     def trace_calls(self, frame: FrameType, event: str, arg: Any):
         """
         Trace the calls of the program.
@@ -58,26 +73,28 @@ class CallTracer:
                 return self.trace_calls
 
             if self.call_stack:
-                caller_file, caller_func, caller_line = self.call_stack[-1]
+                caller_file, caller_func, caller_line, caller_class = self.call_stack[-1]
             else:
-                caller_file, caller_func, caller_line = (None, None, None)
+                caller_file, caller_func, caller_line, caller_class = (None, None, None, None)
 
-            # push the current call to the call stack
-            self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno))
+            # 获取当前被调用函数的类名
+            callee_class = self._get_class_name(frame)
 
-            new_record = {
-                "caller": {
-                    "filepath": caller_file,
-                    "lineno": caller_line,
-                    "func_name": caller_func
-                },
-                "callee": {
-                    "filepath": str(Path(file_name).relative_to(self.base_dir)),
-                    "lineno": lineno,
-                    "func_name": func_name
-                },
-            }
-            record_key = json.dumps(new_record, sort_keys=True)
+            # push the current call to th call stack (包含 class_name)
+            self.call_stack.append((str(Path(file_name).relative_to(self.base_dir)), func_name, lineno, callee_class))
+
+
+            # 先计算一次callee_filepath，避免重复计算
+            callee_filepath = str(Path(file_name).relative_to(self.base_dir))
+            caller_cls = caller_class or ""
+            callee_cls = callee_class or ""
+
+            # 用 tuple 去重（快）
+            record_key = (
+                caller_file, caller_line, caller_func, caller_cls,
+                callee_filepath, lineno, func_name, callee_cls
+            )
+
             # skip if the record is already in the set
             if record_key in self.call_records_set:
                 return self.trace_calls
@@ -86,12 +103,28 @@ class CallTracer:
             if any(v is None for v in [caller_file, caller_func, caller_line, file_name, func_name, lineno]):
                 return self.trace_calls
 
+            # 后续代码中复用已计算的值
+            new_record = {
+                "caller": {
+                    "filepath": caller_file,
+                    "lineno": caller_line,
+                    "func_name": caller_func,
+                    "class_name": caller_cls
+                },
+                "callee": {
+                    "filepath": callee_filepath,  
+                    "lineno": lineno,
+                    "func_name": func_name,
+                    "class_name": callee_cls
+                },
+            }
+            
             self.call_records_set.add(record_key)
             self.call_records.append(new_record)
 
         elif event == "return":
             if self.call_stack:
-                top_file, top_func, top_line = self.call_stack[-1]
+                top_file, top_func, top_line, _top_class = self.call_stack[-1]
                 if self._in_base_dir(top_file) and self._is_function(top_func) and top_func == func_name:
                     # pop the current call from the call stack
                     self.call_stack.pop()

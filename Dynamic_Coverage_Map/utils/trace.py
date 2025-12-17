@@ -1141,7 +1141,15 @@ def generate_test_traces(
                 failed_tests.append(test_name)
                 printf(f"[generate_test_traces] ❌ 测试异常: {test_name} - {e}")
             
+
             count += 1
+            # 每次都更新进度文件（方便实时查看）
+            with open(f"{output_dir}/progress.txt", 'w') as pf:
+                pf.write(f"{count}/{len(tests)}\n")
+                pf.write(f"success={len(traces)}\n")
+                pf.write(f"skipped={len(skipped_tests)}\n")
+                pf.write(f"failed={len(failed_tests)}\n")
+
             if count % 10 == 0 or count == len(tests):
                 printf(f"[generate_test_traces] 进度: {count}/{len(tests)} (成功: {len(traces)}, 跳过: {len(skipped_tests)}, 失败: {len(failed_tests)})")
 
