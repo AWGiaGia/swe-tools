@@ -1,5 +1,7 @@
 # Dynamic trace collection
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 <p align="center">
   <img src="assets/dynamic-trace-collection-architecture.png" alt="Dynamic trace collection architecture" width="100%" />
 </p>
