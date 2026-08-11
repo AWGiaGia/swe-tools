@@ -1,5 +1,9 @@
 # Dynamic trace collection
 
+<p align="center">
+  <img src="assets/dynamic-trace-collection-architecture.png" alt="Dynamic trace collection architecture" width="100%" />
+</p>
+
 > Batch dynamic test-execution tracing for the [IssueExec](https://github.com/code-philia/IssueExec) artifact.
 
 [![IssueExec repository](https://img.shields.io/badge/IssueExec-code--philia%2FIssueExec-181717?logo=github)](https://github.com/code-philia/IssueExec)
