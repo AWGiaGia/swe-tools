@@ -1,5 +1,8 @@
 **/*.jsonl
 **/*.json
 **/*__pycache__
-**/*.logDynamic_Coverage_Map/logs/
-**/*log
+**/*.log
+results*/
+logs/
+Dynamic_Coverage_Map/logs/
+Dynamic_Coverage_Map/*-swe-bench/

@@ -74,7 +74,7 @@ def convert_item(item):
     
     return test_id, {"covered_functions": sorted(functions), "covered_classes": []}
 
-# python parse_coverage_map.py --source_folder /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results_scikit-learn_repaired --save_folder dynamic_scikit-learn_repaired --substring scikit
+# Example: python parse_coverage_map.py --source_folder ./results --save_folder ./results_coverage --substring scikit-learn
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source_folder", type=str, required=True, help="Path to the input folder ")
@@ -106,4 +106,3 @@ if __name__ == "__main__":
             json.dump(target_data, f, indent=4)
         
         
-

@@ -1,5 +1,5 @@
 # SWE-bench Docker 镜像列表
-# 数据集: /home/jiawei/RepoCodeLoc/swe-bench-lite
+# 数据集: SWE-bench Lite
 # 总数: 323
 # 生成时间: 2025-10-03T23:21:41.763343
 

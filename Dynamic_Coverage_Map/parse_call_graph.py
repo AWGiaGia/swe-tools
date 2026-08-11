@@ -168,7 +168,7 @@ def convert_item(item):
     return test_id, call_tree
 
 
-# python parse_call_graph.py --source_folder /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results_scikit-learn_repaired --save_folder dynamic_scikit-learn_call_graph --substring scikit
+# Example: python parse_call_graph.py --source_folder ./results --save_folder ./results_call_graph --substring scikit-learn
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert call-relations data to call tree format with depth-based sorting"

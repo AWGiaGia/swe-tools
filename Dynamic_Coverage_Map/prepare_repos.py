@@ -219,12 +219,12 @@ def prepare_dockers(prepared_repos_root):
 运行docker命令示例：
 docker run -it --pid=host \
 --name swebench-sklearn-10297 \
--v /home/jiawei/RepoCodeLoc/swe-bench-aw-explore/scikit-learn__scikit-learn-10297/local_repo:/workspace/local_repo \
--v /home/jiawei/RepoCodeLoc/swe-bench-aw-explore/scikit-learn__scikit-learn-10297/result:/workspace/result \
+-v /path/to/prepared-repos/scikit-learn__scikit-learn-10297/local_repo:/workspace/local_repo \
+-v /path/to/prepared-repos/scikit-learn__scikit-learn-10297/result:/workspace/result \
 --rm \
 swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10297:latest \
 /bin/bash
-其中，/home/jiawei/RepoCodeLoc/swe-bench-aw-explore是prepared_repos_root路径，swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10297:latest为本地的镜像名称
+其中，`/path/to/prepared-repos` 是 `prepared_repos_root`，末尾镜像名是本地 Docker 镜像名称。
     """
 
     # 获取所有准备好的仓库目录
@@ -403,7 +403,7 @@ def build_repo():
 
 
 if __name__ == '__main__':
-    swe_bench_data = load_swebench_data("/home/jiawei/Agentless/sklearn_swe-bench_lite")
+    swe_bench_data = load_swebench_data("princeton-nlp/SWE-bench_Lite")
 
     prepare_repos(swe_bench_data, "./sklearn-swe-bench")
     prepare_dockers('./sklearn-swe-bench')

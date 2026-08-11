@@ -628,10 +628,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  python docker_batch_runner.py \\
-    --script-dir /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/utils \\
-    --result-dir /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/sklearn-swe-bench \\
-    --image-prefix swebench/sweb.eval.x86_64.scikit-learn_1776
+  python run_dockers.py \\
+    --script-dir ./Dynamic_Coverage_Map/utils \\
+    --result-dir ./results \\
+    --image-prefix ghcr.io/epoch-research/swe-bench.eval.x86_64
 
   # 只处理前5个镜像（用于测试）
   python docker_batch_runner.py --script-dir /path/to/scripts --result-dir /path/to/results --max 5

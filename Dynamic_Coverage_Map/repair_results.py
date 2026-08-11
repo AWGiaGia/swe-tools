@@ -457,7 +457,7 @@ def process_raw_results(raw_results_root_folder, target_results_root_folder, ins
 if __name__ == '__main__':
     # 构建 instance 信息映射，包含 base_commit 和 repo
     instance_info_map = dict()
-    swe_bench_data = load_dataset("/home/jiawei/RepoCodeLoc/swe-bench-lite")
+    swe_bench_data = load_dataset("princeton-nlp/SWE-bench_Lite")
     for item in swe_bench_data['test']:
         instance = item['instance_id']
         instance_info_map[instance] = {
@@ -474,8 +474,8 @@ if __name__ == '__main__':
         issue_part = instance_id.split("__")[-1]
         issue_to_instance[issue_part] = instance_id
 
-    raw_results_root_folder = "/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results"
-    target_results_root_folder = "/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results_repaired"
+    raw_results_root_folder = "./results"
+    target_results_root_folder = "./results_repaired"
     
     # 设置进程数
     num_processes = min(os.cpu_count(), 23)

@@ -299,7 +299,7 @@ def convert_item(item):
 
 
 # 使用示例：
-# python parse_call_tree.py --source_folder /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/results_scikit-learn_repaired --save_folder dynamic_scikit-learn_call_graph --substring scikit --format tree
+# Example: python parse_call_tree.py --source_folder ./results --save_folder ./results_call_tree --substring scikit-learn --format tree
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert call-relations data to tree text format for better LLM understanding"

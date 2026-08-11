@@ -93,14 +93,14 @@ def main():
     
     parser.add_argument(
         '--dataset',
-        default='/home/jiawei/RepoCodeLoc/swe-bench-lite',
-        help='数据集名称 (默认: /home/jiawei/RepoCodeLoc/swe-bench-lite)'
+        default='princeton-nlp/SWE-bench_Lite',
+        help='数据集名称或本地路径 (默认: princeton-nlp/SWE-bench_Lite)'
     )
     
     parser.add_argument(
         '--output',
-        default='/home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/swebench_lite_images.txt',
-        help='输出文件路径 (默认: /home/jiawei/RepoCodeLoc/tools/Dynamic_Coverage_Map/swebench_lite_images.txt)'
+        default='swebench_lite_images.txt',
+        help='输出文件路径 (默认: ./swebench_lite_images.txt)'
     )
     
     args = parser.parse_args()

@@ -1230,7 +1230,7 @@ def main():
     )
 
 
-# excute: python trace.py --project-root /home/jiawei/CommitInsight/repos/scikit-learn --max-workers 16 --output-dir ./scikit-learn-test_cov
+# Example: python trace.py --project-root /path/to/project --max-workers 16 --output-dir ./results/local-smoke
 if __name__ == '__main__':
 
     main()
